@@ -1,0 +1,30 @@
+# --- Entorno virtual --------------------------------------------------
+venv/
+.venv/
+
+# --- Caché de datasets (por carpeta analizada, se regenera sola) -------
+# Contiene embeddings, hashes, rutas absolutas de TU disco — no debe
+# compartirse ni subirse, y puede pesar varios cientos de MB por dataset.
+cache/
+
+# --- Python -------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+
+# --- Streamlit ------------------------------------------------------------
+.streamlit/secrets.toml
+
+# --- Sistema / editor -----------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# --- Salidas generadas por la app (informes de ejemplo, si los guardas
+# en el propio proyecto en vez de en Descargas) ---------------------------
+*.pdf
+!docs/**/*.pdf

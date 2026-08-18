@@ -1,0 +1,32 @@
+# imagedata_viz — requirements
+#
+# IMPORTANTE: instala PyTorch en dos pasos, no con un solo
+# `pip install -r requirements.txt`, o pip puede darte la build de CPU
+# en vez de la de CUDA:
+#
+#   1) pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   2) pip install -r requirements.txt
+#
+# Requiere una GPU NVIDIA con drivers recientes (no hace falta instalar
+# el CUDA Toolkit por separado — la rueda de PyTorch ya lo incluye).
+# Sin GPU NVIDIA, la app funciona pero muy lenta (no probado en CPU).
+#
+# Tras instalar lo de abajo, descarga también el modelo de spaCy:
+#   python -m spacy download en_core_web_sm
+
+open_clip_torch
+transformers
+accelerate
+streamlit
+plotly
+scikit-learn
+scipy
+numpy
+pandas
+pillow
+pillow-heif
+spacy
+umap-learn
+ImageHash
+reportlab
+matplotlib
