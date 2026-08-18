@@ -1,3 +1,5 @@
+![sneaky icon](docs/icon.png)
+
 # sneaky™ Semantic Report
 
 App local (Streamlit) para analizar un feed de imágenes: extrae embeddings
