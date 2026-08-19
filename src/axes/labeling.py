@@ -362,8 +362,20 @@ class ClusterLabeler:
         # use_safetensors=True avoids transformers' torch.load safety block
         # (torch < 2.6 can't load pickle .bin checkpoints) by always fetching
         # the .safetensors weights instead, which don't use pickle.
+        #
+        # low_cpu_mem_usage=False: with accelerate installed, transformers
+        # defaults to a "meta device" loading path (builds the model
+        # skeleton without real data first, fills it in afterward) to save
+        # RAM during loading. This BLIP checkpoint is missing one parameter
+        # (text_decoder.cls.predictions.decoder.bias — newly initialized,
+        # not part of the checkpoint), and that specific parameter can end
+        # up left on the meta device instead of properly materialized,
+        # making the .to(self.device) call below fail with "Cannot copy
+        # out of meta tensor; no data!". Disabling the meta-device path
+        # avoids this entirely — this model is small enough that the extra
+        # RAM during loading doesn't matter.
         self.model = BlipForConditionalGeneration.from_pretrained(
-            model_name, use_safetensors=True
+            model_name, use_safetensors=True, low_cpu_mem_usage=False
         ).to(self.device)
         self.model.eval()
 
