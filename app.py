@@ -676,7 +676,12 @@ if result is not None:
     # made the whole app feel sluggish. Memoize it in session_state, same
     # pattern as the Visual similarity chain section below: only recompute
     # when ITS OWN parameters actually change.
-    scatter_cache_key = (result["path"], projection_method, other_threshold)
+    scatter_cache_key = (
+        result["path"],
+        projection_method,
+        other_threshold,
+        tuple(axis.label for axis in full_axes),
+    )
     if st.session_state.get("scatter_data_cache_key") != scatter_cache_key:
         with st.spinner(
             "Computing projection — this can take a while the first time, "
