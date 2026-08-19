@@ -10,6 +10,9 @@ minor color/exposure edits, actual duplicates.
 
 Comparing two pHashes is just their Hamming distance (bit differences) —
 essentially free computationally, no GPU or model needed.
+
+scipy is imported lazily (inside the functions that use it) — importing
+this module shouldn't pay that cost until it's actually needed.
 """
 
 from __future__ import annotations
@@ -26,10 +29,6 @@ import imagehash
 import numpy as np
 import pillow_heif
 from PIL import Image, ImageOps
-from scipy.cluster.hierarchy import leaves_list, linkage, optimal_leaf_ordering
-from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import connected_components
-from scipy.spatial.distance import pdist, squareform
 
 from src.persistence import cache
 
@@ -152,6 +151,9 @@ def compute_global_order(
     Can be noticeably slower than the greedy chain for large datasets —
     cache the result (see cache.save_global_order).
     """
+    from scipy.cluster.hierarchy import leaves_list, linkage, optimal_leaf_ordering
+    from scipy.spatial.distance import pdist
+
     available = [p for p in paths if str(p) in hashes]
     if len(available) < 2:
         return [(p, None) for p in available]
@@ -210,6 +212,10 @@ def _compute_duplicate_groups(
     Returns (available_paths, groups) where `groups` maps an internal group
     id to a list of indices into `available_paths`.
     """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial.distance import pdist, squareform
+
     available = [p for p in paths if str(p) in hashes]
     if not available:
         return available, {}

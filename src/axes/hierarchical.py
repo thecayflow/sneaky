@@ -14,6 +14,10 @@ tends to "chain" in high-dimensional CLIP embedding space — one giant
 cluster absorbs almost everything while a handful of outlier images form
 tiny singleton clusters. Ward + PCA gives much more balanced, semantically
 meaningful clusters in practice.
+
+scipy and scikit-learn are imported lazily (inside fit()/get_clusters()) —
+importing this module shouldn't pay their import cost until clustering
+actually runs.
 """
 
 from __future__ import annotations
@@ -22,8 +26,6 @@ import logging
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.cluster.hierarchy import fcluster, linkage
-from sklearn.decomposition import PCA
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,9 @@ class HierarchicalAxisEngine:
         Build the hierarchical tree once for the given (n_samples, dim)
         L2-normalized embeddings.
         """
+        from scipy.cluster.hierarchy import linkage
+        from sklearn.decomposition import PCA
+
         n = embeddings.shape[0]
         self._embeddings = embeddings
 
@@ -138,6 +143,8 @@ class HierarchicalAxisEngine:
         """
         if self._Z is None or self._embeddings is None:
             raise RuntimeError("Call fit(embeddings) before get_clusters(k).")
+
+        from scipy.cluster.hierarchy import fcluster
 
         n = self._embeddings.shape[0]
         k = max(MIN_AXES, min(k, n))

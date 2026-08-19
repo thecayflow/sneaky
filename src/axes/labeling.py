@@ -23,6 +23,10 @@ This TF-IDF heuristic is still a stand-in for a smarter approach. A future
 improvement (tracked in BACKLOG.md) is to replace it with an actual LLM
 summarization call for more natural labels — that requires an API key, so
 this heuristic keeps the pipeline fully local/offline for now.
+
+torch, spacy, and transformers are imported lazily (inside the functions/
+methods that use them, not at module level) — all three are heavy, and
+importing this module shouldn't pay that cost until labeling actually runs.
 """
 
 from __future__ import annotations
@@ -45,10 +49,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 import numpy as np
-import spacy
-import torch
 from PIL import Image
-from transformers import BlipForConditionalGeneration, BlipProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,8 @@ def _get_nlp():
     """
     global _NLP
     if _NLP is None:
+        import spacy
+
         try:
             _NLP = spacy.load(DEFAULT_SPACY_MODEL, disable=["ner"])
         except OSError as exc:
@@ -349,6 +352,9 @@ class ClusterLabeler:
     """Wraps a BLIP captioning model to generate labels for clusters."""
 
     def __init__(self, model_name: str = DEFAULT_CAPTION_MODEL, device: str | None = None) -> None:
+        import torch
+        from transformers import BlipForConditionalGeneration, BlipProcessor
+
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         logger.info("Loading captioning model %s on %s", model_name, self.device)
 
@@ -361,17 +367,19 @@ class ClusterLabeler:
         ).to(self.device)
         self.model.eval()
 
-    @torch.no_grad()
     def _caption_image(self, path: Path) -> str:
+        import torch
+
         with Image.open(path) as img:
             img = img.convert("RGB")
             inputs = self.processor(img, return_tensors="pt").to(self.device)
-        output_ids = self.model.generate(
-            **inputs,
-            max_new_tokens=30,
-            repetition_penalty=1.5,
-            no_repeat_ngram_size=3,
-        )
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=30,
+                repetition_penalty=1.5,
+                no_repeat_ngram_size=3,
+            )
         caption = self.processor.decode(output_ids[0], skip_special_tokens=True)
         return caption.strip()
 

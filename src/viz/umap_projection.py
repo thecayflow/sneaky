@@ -4,6 +4,11 @@ src/viz/umap_projection.py
 Reduces the full embedding space down to 2D via UMAP — the second
 projection method alongside t-SNE, cached independently so switching
 between them never invalidates or recomputes the other.
+
+umap and scikit-learn's PCA are imported lazily (inside the function that
+uses them) — umap in particular has a real import cost (it compiles parts
+of itself via numba on first use), so importing this module shouldn't pay
+that cost until a UMAP projection is actually requested.
 """
 
 from __future__ import annotations
@@ -17,8 +22,6 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.append(str(_PROJECT_ROOT))
 
 import numpy as np
-import umap
-from sklearn.decomposition import PCA
 
 from src.persistence import cache
 
@@ -43,6 +46,9 @@ def compute_umap_projection(
     pca_components=None to skip it and run UMAP directly on the full
     embeddings.
     """
+    import umap
+    from sklearn.decomposition import PCA
+
     n_samples = embeddings.shape[0]
     # UMAP's n_neighbors must be less than n_samples, same idea as t-SNE's
     # perplexity clamp — avoids errors on very small datasets.

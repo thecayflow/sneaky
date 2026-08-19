@@ -16,6 +16,12 @@ content — a duotone wash would work against that.
 Public API is unchanged: `generate_pdf_report(...)` takes the same
 arguments and returns the same `bytes` as before, so nothing calling this
 module needs to change.
+
+matplotlib is imported lazily (inside each function that uses it, not at
+module level) — it's the heavier of this module's two big dependencies.
+reportlab stays at module level: its own import cost is small, and its
+color/font constants below are woven through nearly every function, so
+deferring it would add much more restructuring risk for little benefit.
 """
 
 from __future__ import annotations
@@ -30,10 +36,6 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.append(str(_PROJECT_ROOT))
 
-import matplotlib
-
-matplotlib.use("Agg")  # headless — no GUI backend needed/available
-import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image, ImageOps
 from reportlab.lib import colors
@@ -148,6 +150,7 @@ def _configure_matplotlib_fonts() -> dict[str, str | None]:
         "cond_semibold": None,
     }
     try:
+        import matplotlib.pyplot as plt
         from matplotlib import font_manager
 
         name_map = {
@@ -169,7 +172,18 @@ def _configure_matplotlib_fonts() -> dict[str, str | None]:
     return resolved
 
 
-MPL_FONT = _configure_matplotlib_fonts()
+# Lazy singleton — was previously computed eagerly at module import time
+# (`MPL_FONT = _configure_matplotlib_fonts()`), which forced matplotlib to
+# be imported just by importing this module. Now computed on first actual
+# use, via _get_mpl_font_map() below, same pattern as `_NLP` in labeling.py.
+_MPL_FONT_CACHE: dict[str, str | None] | None = None
+
+
+def _get_mpl_font_map() -> dict[str, str | None]:
+    global _MPL_FONT_CACHE
+    if _MPL_FONT_CACHE is None:
+        _MPL_FONT_CACHE = _configure_matplotlib_fonts()
+    return _MPL_FONT_CACHE
 
 
 def _mpl_font(role: str) -> dict:
@@ -178,7 +192,7 @@ def _mpl_font(role: str) -> dict:
     'cond_semibold') — resolves to the real registered Barlow font when its
     file is present, otherwise falls back to matplotlib's own bold/regular
     weight so text is never left unstyled."""
-    name = MPL_FONT.get(role)
+    name = _get_mpl_font_map().get(role)
     if name:
         return {"fontfamily": name}
     return {"fontweight": "bold"} if role in ("bold", "medium", "cond_semibold") else {}
@@ -373,6 +387,11 @@ def _metric_card(value: str, label: str, styles: dict) -> _Blueprint:
 def _render_donut(
     labels: list[str], values: list[float], chart_colors: list[str], title: str
 ) -> io.BytesIO:
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless — no GUI backend needed/available
+    import matplotlib.pyplot as plt
+
     fig, ax = plt.subplots(figsize=(2.6, 2.15), dpi=200)
     wedges, _ = ax.pie(
         values,
@@ -408,6 +427,11 @@ def _render_donut(
 
 
 def _render_bar_chart(axis_sizes: dict[str, int]) -> io.BytesIO:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     items = sorted(axis_sizes.items(), key=lambda kv: kv[1])
     labels = [k for k, _ in items]
     values = [v for _, v in items]
@@ -526,6 +550,11 @@ def _render_treemap(axis_sizes: dict[str, int]) -> io.BytesIO:
     readable label are left blank rather than overflowing text onto
     neighboring cells.
     """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     items = sorted(axis_sizes.items(), key=lambda kv: -kv[1])
     labels = [k for k, _ in items]
     values = [v for _, v in items]
@@ -585,6 +614,11 @@ def _render_dual_radar(
 ) -> io.BytesIO:
     """Two polar radar charts side by side — Dominance % and Normalized
     similarity, same axes, for direct visual comparison."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
     angles_closed = angles + angles[:1]
 
@@ -637,6 +671,11 @@ def _render_umap_scatter(
     legend — position/orientation means nothing on its own, only which
     points cluster together does. Colors are an on-brand steel-blue family
     (see `_categorical_palette`) rather than a generic rainbow palette."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     unique_labels = sorted(set(point_labels))
     palette = _categorical_palette(len(unique_labels))
     color_map = dict(zip(unique_labels, palette))

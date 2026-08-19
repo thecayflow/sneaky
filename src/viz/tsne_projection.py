@@ -5,6 +5,10 @@ Reduces the full embedding space (768D with ViT-L-14) down to 2D via t-SNE,
 for the scatter-plot alternative to the radar. Cached per dataset (not per
 k or linkage method — it only depends on the embeddings themselves), since
 t-SNE is too slow to recompute on every interaction.
+
+scikit-learn is imported lazily (inside the function that uses it) —
+importing this module shouldn't pay that cost until a projection is
+actually requested.
 """
 
 from __future__ import annotations
@@ -18,8 +22,6 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.append(str(_PROJECT_ROOT))
 
 import numpy as np
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 
 from src.persistence import cache
 
@@ -46,6 +48,9 @@ def compute_tsne_projection(
     perplexity must be less than n_samples (scikit-learn requirement) — it's
     clamped down automatically for small datasets instead of erroring out.
     """
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE
+
     n_samples = embeddings.shape[0]
     perplexity = min(30, max(2, n_samples - 1))
 

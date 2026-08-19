@@ -4,6 +4,13 @@ src/embeddings/clip_embedder.py
 Generates CLIP image embeddings for a list of image paths, in batches,
 using the GPU when available. Embeddings are L2-normalized so downstream
 cosine similarity is a plain dot product.
+
+torch and open_clip are imported lazily (inside functions/methods, not at
+module level) — they're heavy (multi-second import cost on their own),
+and importing this module (e.g. transitively, just by app.py starting up)
+shouldn't pay that cost until an embedding actually needs to happen. See
+BACKLOG.md — this is one of several modules converted this way to speed
+up the app's startup time.
 """
 
 from __future__ import annotations
@@ -13,15 +20,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import open_clip
 import pillow_heif
-import torch
 from PIL import Image, ImageOps
-from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 # Registers HEIC/HEIF as an opener Pillow understands — must happen before
-# any Image.open() call on such a file. Safe to call multiple times.
+# any Image.open() call on such a file. Safe to call multiple times. This
+# one is lightweight (no torch/heavy deps), so it stays at module level.
 pillow_heif.register_heif_opener()
 
 logger = logging.getLogger(__name__)
@@ -53,57 +58,6 @@ class EmbeddingResult:
     failed: list[tuple[Path, str]]  # images that failed to load/encode, with reason
 
 
-class _ImagePathDataset(Dataset):
-    """
-    Loads + preprocesses one image per __getitem__ call. Designed to be
-    driven by a DataLoader with num_workers>0, so this decode/resize work
-    happens in parallel background processes instead of blocking the GPU.
-
-    Failures are caught here (not raised) — a DataLoader worker process
-    crashing on one bad file would otherwise take down the whole batch.
-    """
-
-    def __init__(self, paths: list[Path], preprocess) -> None:
-        self.paths = paths
-        self.preprocess = preprocess
-
-    def __len__(self) -> int:
-        return len(self.paths)
-
-    def __getitem__(self, idx: int):
-        path = self.paths[idx]
-        try:
-            with Image.open(path) as img:
-                # Apply EXIF orientation before anything else — Pillow loads
-                # raw pixel data as-is and ignores the EXIF orientation tag
-                # by default, so a photo stored sideways-with-a-rotate-flag
-                # would otherwise get embedded (and thumbnailed) rotated
-                # incorrectly.
-                img = ImageOps.exif_transpose(img)
-                img = img.convert("RGB")
-                tensor = self.preprocess(img)
-            return path, tensor, None
-        except Exception as exc:  # noqa: BLE001
-            return path, None, str(exc)
-
-
-def _collate_batch(batch):
-    """Split a batch into (successfully loaded) vs (failed) items."""
-    paths, tensors, errors = zip(*batch)
-
-    valid = [(p, t) for p, t, e in zip(paths, tensors, errors) if e is None]
-    failed = [(p, e) for p, t, e in zip(paths, tensors, errors) if e is not None]
-
-    if valid:
-        valid_paths, valid_tensors = zip(*valid)
-        stacked = torch.stack(valid_tensors)
-        valid_paths = list(valid_paths)
-    else:
-        valid_paths, stacked = [], None
-
-    return valid_paths, stacked, failed
-
-
 class ClipEmbedder:
     """Wraps an open_clip model to turn images into L2-normalized embeddings."""
 
@@ -113,6 +67,9 @@ class ClipEmbedder:
         pretrained: str = DEFAULT_PRETRAINED,
         device: str | None = None,
     ) -> None:
+        import open_clip
+        import torch
+
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         logger.info("Loading CLIP model %s (%s) on %s", model_name, pretrained, self.device)
 
@@ -127,7 +84,6 @@ class ClipEmbedder:
         self.tokenizer = open_clip.get_tokenizer(model_name)
         self.embedding_dim = model.visual.output_dim
 
-    @torch.no_grad()
     def embed_images(
         self,
         image_paths: list[Path],
@@ -147,6 +103,62 @@ class ClipEmbedder:
         Images that fail to load are skipped and reported separately
         rather than crashing the whole run.
         """
+        import torch
+        from torch.utils.data import DataLoader, Dataset
+
+        # Defined here (not at module level) so importing this module
+        # doesn't require torch to already be loaded — see module docstring.
+        class _ImagePathDataset(Dataset):
+            """
+            Loads + preprocesses one image per __getitem__ call. Designed to
+            be driven by a DataLoader with num_workers>0, so this
+            decode/resize work happens in parallel background processes
+            instead of blocking the GPU.
+
+            Failures are caught here (not raised) — a DataLoader worker
+            process crashing on one bad file would otherwise take down the
+            whole batch.
+            """
+
+            def __init__(self, paths: list[Path], preprocess) -> None:
+                self.paths = paths
+                self.preprocess = preprocess
+
+            def __len__(self) -> int:
+                return len(self.paths)
+
+            def __getitem__(self, idx: int):
+                path = self.paths[idx]
+                try:
+                    with Image.open(path) as img:
+                        # Apply EXIF orientation before anything else —
+                        # Pillow loads raw pixel data as-is and ignores the
+                        # EXIF orientation tag by default, so a photo stored
+                        # sideways-with-a-rotate-flag would otherwise get
+                        # embedded (and thumbnailed) rotated incorrectly.
+                        img = ImageOps.exif_transpose(img)
+                        img = img.convert("RGB")
+                        tensor = self.preprocess(img)
+                    return path, tensor, None
+                except Exception as exc:  # noqa: BLE001
+                    return path, None, str(exc)
+
+        def _collate_batch(batch):
+            """Split a batch into (successfully loaded) vs (failed) items."""
+            paths, tensors, errors = zip(*batch)
+
+            valid = [(p, t) for p, t, e in zip(paths, tensors, errors) if e is None]
+            failed = [(p, e) for p, t, e in zip(paths, tensors, errors) if e is not None]
+
+            if valid:
+                valid_paths, valid_tensors = zip(*valid)
+                stacked = torch.stack(valid_tensors)
+                valid_paths = list(valid_paths)
+            else:
+                valid_paths, stacked = [], None
+
+            return valid_paths, stacked, failed
+
         dataset = _ImagePathDataset(image_paths, self.preprocess)
         loader = DataLoader(
             dataset,
@@ -161,7 +173,9 @@ class ClipEmbedder:
         valid_paths: list[Path] = []
         failed: list[tuple[Path, str]] = []
 
-        with tqdm(total=len(image_paths), desc="Embedding images", unit="img") as pbar:
+        with torch.no_grad(), tqdm(
+            total=len(image_paths), desc="Embedding images", unit="img"
+        ) as pbar:
             for batch_paths, batch_tensor, batch_failed in loader:
                 for path, reason in batch_failed:
                     logger.warning("Failed to load %s for embedding: %s", path, reason)
@@ -191,17 +205,19 @@ class ClipEmbedder:
 
         return EmbeddingResult(paths=valid_paths, embeddings=embeddings_array, failed=failed)
 
-    @torch.no_grad()
     def embed_text(self, text: str) -> np.ndarray:
         """
         Embed a single free-text label (e.g. "sky") into the same space as
         the image embeddings, L2-normalized so it's directly comparable via
         dot product. Used for user-defined custom axes.
         """
-        tokens = self.tokenizer([text]).to(self.device)
-        features = self.model.encode_text(tokens)
-        features = features / features.norm(dim=-1, keepdim=True)
-        return features.cpu().numpy()[0]
+        import torch
+
+        with torch.no_grad():
+            tokens = self.tokenizer([text]).to(self.device)
+            features = self.model.encode_text(tokens)
+            features = features / features.norm(dim=-1, keepdim=True)
+            return features.cpu().numpy()[0]
 
 
 if __name__ == "__main__":
