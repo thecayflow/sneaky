@@ -26,6 +26,8 @@
 - [x] **Calibrar el umbral de `threshold_pct`**: resuelto retirándolo del todo — `aggregate_scores`, `threshold_pct` y `DEFAULT_THRESHOLD` eliminados de `scoring.py`. `get_radar_values_by_dominance` y `get_radar_values_normalized` son las dos agregaciones reales que usa el radar
 - [x] **Normalizar también el valor del radar para ejes personalizados**: implementado — `scoring.get_radar_values_normalized()` (min-max por eje antes de promediar), usado en el modo "Normalized similarity" del radar (antes "Mean similarity")
 
+- [ ] **Distribución a terceros vía `install.bat` + `run.bat`** (en la raíz del repo, junto a `app.py`): automatizar la creación del venv + `pip install -r requirements.txt` + descarga del modelo de spaCy, para que alguien con Windows 11 + GPU NVIDIA pueda instalarlo con un doble clic, sin usar terminal. `install.bat` terminaría con un script de verificación ("doctor") que importa cada librería clave una por una y muestra un checklist real (PyTorch/CUDA/GPU — `torch.cuda.is_available()` de verdad, no cosmético —, OpenCLIP, Transformers, spaCy, Streamlit, UMAP, ReportLab: OK/FAIL cada una). No oculta el código (mismo nivel de exposición que clonar el repo — no es el objetivo ahora mismo), y sigue requiriendo que el destinatario ya tenga Python instalado y en el PATH. Alternativa a PyInstaller: mucho menos esfuerzo, sin los problemas típicos de empaquetar PyTorch/CUDA en un .exe. Descartado por ahora explorar PyInstaller/instalador que oculte el código (no es prioridad del usuario)
+
 ## Notas
 
 - Este fichero es una lista viva — se puede ir marcando `[x]` a medida que se completen items, o añadir nuevos a mano.
