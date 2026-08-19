@@ -773,6 +773,9 @@ def generate_pdf_report(
     radar_normalized_values: dict[str, float] | None = None,
     umap_coords: np.ndarray | None = None,
     umap_labels: list[str] | None = None,
+    clip_mmd: float | None = None,
+    clip_mmd_baseline: float | None = None,
+    compare_dataset_name: str | None = None,
 ) -> bytes:
     """
     Build the full Dataset Report PDF and return its bytes (ready for a
@@ -850,6 +853,16 @@ def generate_pdf_report(
             f"<b>{overview.visual_duplicates_count:,} images belong to near-duplicate "
             "groups.</b> This may be expected (e.g. burst-mode photos) or a sign of "
             "redundancy, depending on what this dataset is for."
+        )
+    if clip_mmd is not None and clip_mmd_baseline is not None and compare_dataset_name:
+        callout_lines.append(
+            f"<b>Compared with \u201c{compare_dataset_name}\u201d: distributional "
+            f"distance {clip_mmd:.3f}.</b> For reference, splitting this dataset "
+            f"into two random halves gives {clip_mmd_baseline:.3f} \u2014 that's "
+            "roughly the gap you'd expect from sampling alone, even between two "
+            "halves of the exact same dataset. A distance well above that suggests "
+            "a genuinely different overall makeup; a distance close to it suggests "
+            "the two are hard to tell apart, distribution-wise."
         )
     if callout_lines:
         callout_inner = Table(

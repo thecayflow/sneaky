@@ -61,6 +61,7 @@ from src.similarity.phash import (
 )
 from src.report.metrics import compute_overview_metrics, get_representative_images_by_axis
 from src.report.pdf_report import generate_pdf_report
+from src.scoring.dataset_similarity import compute_clip_mmd, compute_self_split_mmd
 from src.viz.umap_projection import get_or_compute_umap
 
 MAX_AXES = 25  # soft cap for the + button; raising axis count re-runs captioning
@@ -974,6 +975,21 @@ if result is not None:
                 result["embeddings"], full_axes, other_threshold=other_threshold
             )
 
+            # CLIP-MMD — a single "how similar overall" number between the
+            # two feeds, only when a comparison feed is loaded. Reuses the
+            # embeddings already computed for both feeds, no new embedding
+            # pass needed. The self-split baseline gives a same-dataset
+            # "noise floor" to read the cross-feed number against.
+            clip_mmd_value = None
+            clip_mmd_baseline_value = None
+            compare_dataset_name = None
+            if compare_result is not None:
+                clip_mmd_value = compute_clip_mmd(
+                    result["embeddings"], compare_result["embeddings"]
+                )
+                clip_mmd_baseline_value = compute_self_split_mmd(result["embeddings"])
+                compare_dataset_name = compare_result["dataset_name"]
+
             st.session_state.pdf_report_bytes = generate_pdf_report(
                 dataset_name=result["dataset_name"],
                 overview=overview,
@@ -984,6 +1000,9 @@ if result is not None:
                 radar_normalized_values=radar_normalized_values,
                 umap_coords=umap_coords,
                 umap_labels=umap_dominant_labels,
+                clip_mmd=clip_mmd_value,
+                clip_mmd_baseline=clip_mmd_baseline_value,
+                compare_dataset_name=compare_dataset_name,
             )
 
     if st.session_state.pdf_report_bytes:
