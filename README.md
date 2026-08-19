@@ -176,3 +176,72 @@ cacheada (`src/pipeline.py::_update_embeddings_incrementally`):
 
 También se puede gestionar la caché manualmente desde la propia interfaz
 ("Cache management", al final de la página) sin tocar el disco a mano.
+
+### DataLoader con `num_workers>0` fallando en Windows/Streamlit
+
+**Fecha**: tras subir el proyecto a GitHub y probarlo con un dataset nuevo.
+
+**Qué pasó**: al embeber imágenes, el proceso falló con:
+
+```
+OSError: [WinError 6] Controlador no válido
+  File "...multiprocessing\spawn.py", line 113, in spawn_main
+    new_handle = reduction.duplicate(pipe_handle, ...)
+```
+
+**Por qué pasa**: `ClipEmbedder.embed_images` usa un `DataLoader` de PyTorch
+con varios procesos en paralelo (`num_workers=4` en su momento) para
+decodificar/preprocesar imágenes mientras la GPU trabaja en el lote
+anterior. En Windows, esto usa el método de arranque `spawn` — cada worker
+es un intérprete de Python nuevo por completo, no un `fork` ligero como en
+Linux/macOS — y bajo un proceso lanzado por Streamlit, la duplicación de
+handles de Windows necesaria para levantar esos workers falló de forma
+intermitente.
+
+**Solución aplicada**: `DEFAULT_NUM_WORKERS` en `src/embeddings/clip_embedder.py`
+pasó de `4` a `0` (sin paralelismo, un solo proceso) — más lento al cargar
+imágenes, pero sin esta clase de fallo. Si en algún momento se despliega
+en Linux/macOS (o en un Windows donde se confirme que la carga paralela
+es estable), subir este valor de nuevo es seguro de probar.
+
+### `BlipForConditionalGeneration` fallando con "Cannot copy out of meta tensor"
+
+**Fecha**: al reanalizar el mismo dataset con un `k` distinto, dentro de la
+misma sesión de la app.
+
+**Qué pasó**: la carga de BLIP (`ClusterLabeler.__init__`) falló con:
+
+```
+Cannot copy out of meta tensor; no data! Please use torch.nn.Module.to_empty()
+instead of torch.nn.Module.to() when moving module from meta to a different device.
+```
+
+No en todas las ejecuciones — funcionaba la primera vez y fallaba en
+reanálisis posteriores dentro del mismo proceso.
+
+**Por qué pasa**: con `accelerate` instalado, `transformers` carga los
+modelos por un camino más "perezoso" por defecto: crea primero el modelo
+en un dispositivo especial llamado "meta" (solo la forma de los tensores,
+sin datos reales, para ahorrar RAM durante la carga) y lo rellena después.
+El checkpoint de BLIP no incluye un parámetro concreto
+(`text_decoder.cls.predictions.decoder.bias` — se ve como `MISSING` en el
+log, se reinicializa nuevo) que además está **enlazado** (*tied*) a otra
+capa del modelo. Ese parámetro concreto podía quedarse en el dispositivo
+meta sin materializarse del todo, y `.to(device)` fallaba al no tener
+datos reales que copiar.
+
+**Solución aplicada**, en `src/axes/labeling.py::ClusterLabeler.__init__`:
+1. `low_cpu_mem_usage=False` en `from_pretrained(...)` — desactiva la vía
+   de carga por dispositivo meta directamente (por sí solo no fue
+   suficiente).
+2. `self.model.tie_weights()` explícito, justo después de `from_pretrained`
+   y antes de `.to(self.device)` — fuerza a resolver correctamente el
+   parámetro enlazado antes de mover el modelo, que es lo que arregló el
+   fallo de verdad.
+
+**Por qué importa para el futuro**: si se añade otro modelo de Hugging
+Face con parámetros enlazados (*tied weights* — habitual en cabezas de
+salida de texto que comparten memoria con la capa de embeddings), vale la
+pena aplicar el mismo patrón (`low_cpu_mem_usage=False` + `tie_weights()`
+antes de `.to(device)`) si aparece este mismo error.
+

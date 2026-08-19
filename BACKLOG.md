@@ -30,6 +30,9 @@
 
 - [x] **Fix: caché de Scatter view no se refrescaba al reetiquetar ejes**: tras borrar caché y reanalizar (nuevos labels vía noun chunks), el radar se actualizaba pero el scatter (t-SNE/UMAP) seguía mostrando colores/etiquetas antiguas — la clave de memoización en session_state (`scatter_data_cache_key`) solo consideraba `(path, projection_method, other_threshold)`, no los propios ejes. Fix: añadido `tuple(axis.label for axis in full_axes)` a la clave, así cualquier cambio en los ejes (reetiquetado, custom axes añadidos/quitados, ejes excluidos) fuerza el recálculo automáticamente
 
+- [x] **Fix: "Cannot copy out of meta tensor" al analizar dos veces seguidas con distinto k**: BLIP (`ClusterLabeler`) fallaba al mover el modelo a GPU tras `from_pretrained()` — un parámetro enlazado (`text_decoder.cls.predictions.decoder.bias`, MISSING/reinicializado) se quedaba en el dispositivo "meta" sin datos reales. `low_cpu_mem_usage=False` solo no bastó; el fix real fue añadir `model.tie_weights()` explícito antes de `.to(device)`, en `labeling.py::ClusterLabeler.__init__`. Validado por el usuario reanalizando 20→10→5 ejes seguidos sin fallo
+- [ ] **BLIP se recarga en cada "Analyze"** (detectado durante el debug del bug anterior): `ClusterLabeler`, a diferencia de `ClipEmbedder` (cacheado vía `@st.cache_resource` en `get_embedder()`), no está cacheado — se recarga desde cero cada vez que se pulsa Analyze, aunque no haya cambiado de dataset. No es un bug (funciona bien), pero es tiempo desperdiciado; candidato a cachear igual que el embedder
+
 ## Notas
 
 - Este fichero es una lista viva — se puede ir marcando `[x]` a medida que se completen items, o añadir nuevos a mano.
