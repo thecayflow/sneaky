@@ -60,15 +60,16 @@ _NLP = None  # lazy-loaded singleton — spaCy model load isn't free
 
 def _get_nlp():
     """
-    Load the spaCy POS-tagging pipeline once and reuse it. Only the
-    tagger/attribute_ruler components are needed (not parser or NER), so
-    those are disabled for speed — captions are short, but no need to pay
-    for dependency parsing we never use.
+    Load the spaCy pipeline once and reuse it. NER is disabled (never used
+    here), but the parser MUST stay enabled — `doc.noun_chunks` (used for
+    the phrase-based labels below) is derived from the dependency parse
+    and returns nothing without it. Captions are short, so the extra cost
+    of running the parser is negligible in practice.
     """
     global _NLP
     if _NLP is None:
         try:
-            _NLP = spacy.load(DEFAULT_SPACY_MODEL, disable=["parser", "ner"])
+            _NLP = spacy.load(DEFAULT_SPACY_MODEL, disable=["ner"])
         except OSError as exc:
             raise RuntimeError(
                 f"spaCy model '{DEFAULT_SPACY_MODEL}' not found. Install it with:\n"
@@ -88,8 +89,69 @@ def _get_noun_words(captions: list[str]) -> set[str]:
     return nouns
 
 
+def _clean_noun_chunk(chunk_text: str) -> str | None:
+    """
+    Lowercase a spaCy noun_chunk, strip leading determiners/possessives,
+    cap it at MAX_LABEL_WORDS, and reject it entirely if what's left isn't
+    a useful label (empty, a single stopword, or headed by a generic
+    person noun like "man"/"person" — same reasoning as the single-word
+    heuristic, just applied to the chunk's head noun instead of a bare word).
+    """
+    words = chunk_text.lower().split()
+    while words and words[0] in LEADING_DETERMINERS:
+        words = words[1:]
+    if not words:
+        return None
+    if len(words) > MAX_LABEL_WORDS:
+        words = words[:MAX_LABEL_WORDS]
+    if words[-1] in GENERIC_PERSON_NOUNS:
+        return None
+    if len(words) == 1 and (words[0] in STOPWORDS or len(words[0]) <= 2):
+        return None
+    return " ".join(words)
+
+
+def _get_noun_chunks(captions: list[str]) -> list[list[str]]:
+    """
+    For each caption, its cleaned noun chunks — spaCy's dependency-parse
+    -derived noun phrases (e.g. "a young child" -> "young child"), richer
+    than single-word nouns since a phrase like "orange shirts" captures a
+    visual attribute that a single word ("orange" or "shirts" alone) would
+    lose. Requires the parser (see _get_nlp).
+    """
+    nlp = _get_nlp()
+    all_chunks: list[list[str]] = []
+    for doc in nlp.pipe(captions):
+        cleaned = []
+        for chunk in doc.noun_chunks:
+            cleaned_text = _clean_noun_chunk(chunk.text)
+            if cleaned_text is not None:
+                cleaned.append(cleaned_text)
+        all_chunks.append(cleaned)
+    return all_chunks
+
+
 DEFAULT_CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 DEFAULT_TOP_N_REPRESENTATIVES = 8
+MAX_LABEL_WORDS = 3  # keeps phrase labels compact enough for the radar/mosaic/PDF
+
+# Generic person nouns — near-ubiquitous in personal photo captions, so
+# they rarely help distinguish one semantic cluster from another. "people"
+# is deliberately excluded from this set: as a collective it can denote a
+# real scene type (crowds/gatherings), unlike singular "man"/"boy"/etc.
+GENERIC_PERSON_NOUNS = {
+    "man", "men", "woman", "women", "boy", "boys", "girl", "girls",
+    "baby", "babies", "kid", "kids", "child", "children", "person",
+}
+
+# Leading words to strip from a noun chunk before using it as a label —
+# spaCy's noun_chunks include determiners/possessives ("a young child" ->
+# "young child"), which read awkwardly as a short axis label.
+LEADING_DETERMINERS = {
+    "a", "an", "the", "this", "that", "these", "those", "my", "your", "his",
+    "her", "its", "our", "their", "some", "many", "several", "few", "each",
+    "every", "any", "no",
+}
 
 # Small stopword list — enough to filter out captioning boilerplate words.
 # Not meant to be exhaustive, just enough for short BLIP-style captions.
@@ -97,12 +159,7 @@ STOPWORDS = {
     "a", "an", "the", "of", "in", "on", "at", "with", "and", "is", "are",
     "to", "for", "by", "it", "its", "this", "that", "some", "there", "as",
     "photo", "picture", "image", "close", "up", "shot", "view", "background",
-    # Generic person nouns — near-ubiquitous in personal photo captions,
-    # so they rarely help distinguish one semantic cluster from another.
-    # "people" is deliberately kept: as a collective it can denote a real
-    # scene type (crowds/gatherings), unlike singular "man"/"boy"/etc.
-    "man", "men", "woman", "women", "boy", "boys", "girl", "girls",
-    "baby", "babies", "kid", "kids", "child", "children", "person",
+    *GENERIC_PERSON_NOUNS,
 }
 
 
@@ -191,6 +248,103 @@ def _extract_keywords_tfidf(captions_per_cluster: list[list[str]]) -> list[str]:
     return final_labels
 
 
+def _extract_keywords_noun_chunks(captions_per_cluster: list[list[str]]) -> list[str | None]:
+    """
+    Pick one distinctive SHORT PHRASE per cluster (spaCy noun chunks, e.g.
+    "young child" or "orange shirts") instead of a single word — phrases
+    capture visual attributes ("running race") that a lone word ("race" or
+    "running") loses on its own. Same cross-cluster TF-IDF idea as the
+    word-level version above: a phrase scores high if it's frequent in
+    this cluster's captions but rare in other clusters' captions.
+
+    Returns None (not a fallback string) for any cluster where no usable
+    noun chunk was found at all — the caller (_extract_keywords) decides
+    how to fill that gap, so this function stays a pure "phrase attempt".
+    """
+    n_clusters = len(captions_per_cluster)
+
+    chunks_per_cluster = [_get_noun_chunks(captions) for captions in captions_per_cluster]
+
+    term_freq_per_cluster: list[Counter[str]] = []
+    doc_freq: Counter[str] = Counter()
+
+    for chunks_per_caption in chunks_per_cluster:
+        # Count each phrase at most once per caption — same rationale as
+        # the word-level version: one degenerate/repetitive caption
+        # shouldn't be able to dominate the term frequency on its own.
+        tf: Counter[str] = Counter()
+        for chunks_in_one_caption in chunks_per_caption:
+            tf.update(set(chunks_in_one_caption))
+        term_freq_per_cluster.append(tf)
+        for term in tf:
+            doc_freq[term] += 1
+
+    ranked_per_cluster: list[list[str]] = []
+    for tf in term_freq_per_cluster:
+        if not tf:
+            ranked_per_cluster.append([])
+            continue
+        scored_terms = []
+        for term, freq in tf.items():
+            idf = math.log((n_clusters + 1) / (doc_freq[term] + 1)) + 1.0
+            score = freq * idf
+            # With only a handful of captions per cluster, exact-phrase
+            # ties are common (several distinct candidates land on the
+            # exact same freq/doc_freq). A mild per-word bonus (capped by
+            # MAX_LABEL_WORDS, so at most +20% for a 3-word phrase) breaks
+            # those ties toward the more descriptive multi-word candidate
+            # instead of an incidental short word winning by default —
+            # e.g. "plate of food" over "table" for a food-themed cluster.
+            n_words = len(term.split())
+            score *= 1 + 0.10 * (n_words - 1)
+            scored_terms.append((score, term))
+        scored_terms.sort(key=lambda x: -x[0])
+        ranked_per_cluster.append([term for _, term in scored_terms])
+
+    # Same greedy conflict resolution as the word-level version: clusters
+    # are processed in their given order (largest first), so bigger
+    # clusters get first pick when two would otherwise want the same phrase.
+    used_labels: set[str] = set()
+    final_labels: list[str | None] = []
+    for ranked_candidates in ranked_per_cluster:
+        chosen = next((term for term in ranked_candidates if term not in used_labels), None)
+        final_labels.append(chosen)
+        if chosen is not None:
+            used_labels.add(chosen)
+
+    return final_labels
+
+
+def _extract_keywords(captions_per_cluster: list[list[str]]) -> list[str]:
+    """
+    Public entry point: one distinctive label per cluster — a short noun
+    phrase where possible (e.g. "orange shirts", "running race"), falling
+    back to the single-distinctive-word heuristic for any cluster where no
+    usable noun chunk could be extracted at all, so no cluster is ever
+    left unlabeled.
+    """
+    phrase_labels = _extract_keywords_noun_chunks(captions_per_cluster)
+    if all(label is not None for label in phrase_labels):
+        return phrase_labels  # type: ignore[return-value]
+
+    word_labels = _extract_keywords_tfidf(captions_per_cluster)
+    used = {label for label in phrase_labels if label is not None}
+    final: list[str] = []
+    for phrase_label, word_label in zip(phrase_labels, word_labels):
+        if phrase_label is not None:
+            final.append(phrase_label)
+            continue
+        candidate = word_label
+        if candidate in used:
+            # Extremely unlikely (a fallback word colliding with an
+            # already-chosen phrase) — disambiguate rather than silently
+            # duplicate a label.
+            candidate = f"{candidate} (2)"
+        used.add(candidate)
+        final.append(candidate)
+    return final
+
+
 class ClusterLabeler:
     """Wraps a BLIP captioning model to generate labels for clusters."""
 
@@ -267,7 +421,7 @@ class ClusterLabeler:
                 captions,
             )
 
-        labels = _extract_keywords_tfidf(all_captions)
+        labels = _extract_keywords(all_captions)
 
         results = [
             ClusterLabel(
