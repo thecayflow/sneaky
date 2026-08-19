@@ -376,7 +376,14 @@ class ClusterLabeler:
         # RAM during loading doesn't matter.
         self.model = BlipForConditionalGeneration.from_pretrained(
             model_name, use_safetensors=True, low_cpu_mem_usage=False
-        ).to(self.device)
+        )
+        # Explicitly re-resolve tied weights (BLIP's text decoder head
+        # shares/ties its output bias with another layer) before moving
+        # off the meta device — without this, the tied parameter can stay
+        # a meta placeholder even with low_cpu_mem_usage=False, and .to()
+        # then fails with "Cannot copy out of meta tensor; no data!".
+        self.model.tie_weights()
+        self.model = self.model.to(self.device)
         self.model.eval()
 
     def _caption_image(self, path: Path) -> str:
