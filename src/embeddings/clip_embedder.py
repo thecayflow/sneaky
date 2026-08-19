@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # mentioning "spawn" or the app seems to relaunch itself, pass
 # num_workers=0 to ClipEmbedder.embed_images(...) to fall back to the
 # original single-process behavior while we investigate.
-DEFAULT_NUM_WORKERS = 4
+DEFAULT_NUM_WORKERS = 0
 
 # Default model — good speed/quality balance on a single consumer GPU.
 # Upgraded from ViT-B-32 to ViT-L-14 for higher-quality embeddings, at the
