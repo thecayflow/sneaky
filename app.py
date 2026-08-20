@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import io
 import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -138,6 +139,11 @@ if "scatter_cluster_numbers" not in st.session_state:
     st.session_state.scatter_cluster_numbers = None
 if "scatter_similarities" not in st.session_state:
     st.session_state.scatter_similarities = None
+if "copied_sources" not in st.session_state:
+    # dest folder (resolved absolute path string) -> set of resolved source
+    # image paths already copied there this session, so re-copying an axis
+    # into the same destination never duplicates a file that's already there.
+    st.session_state.copied_sources = {}
 
 
 def run_analysis(path: str, k: int, linkage_method: str) -> None:
@@ -266,16 +272,86 @@ def show_single_image_dialog(info: dict) -> None:
     )
 
 
+def _copy_axis_images_to(label: str, dest_folder: str, embeddings, axes, paths, other_threshold: float) -> str:
+    """
+    Copies every image currently assigned to `label` into dest_folder
+    (created automatically if needed), skipping any source image already
+    copied there earlier this session — so clicking "Copy images to..."
+    again for the same axis/destination combo is always safe and never
+    duplicates a file.
+
+    Returns the summary message; the caller displays it (kept separate so
+    the caller can decide exactly when/how to show it).
+    """
+    dest_dir = Path(dest_folder)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    ranked = get_ranked_images_for_axis(embeddings, axes, paths, label, other_threshold)
+    source_paths = [p for p, _ in ranked]
+
+    dest_key = str(dest_dir.resolve())
+    already_copied = st.session_state.copied_sources.setdefault(dest_key, set())
+    existing_names = {p.name for p in dest_dir.iterdir() if p.is_file()}
+
+    to_copy = [p for p in source_paths if str(p.resolve()) not in already_copied]
+    skipped_count = len(source_paths) - len(to_copy)
+    total = len(to_copy)
+
+    if total > 0:
+        progress_bar = st.progress(0, text=f"Copying images from '{label}'...")
+        for i, src in enumerate(to_copy, start=1):
+            # Two different source folders can contain a same-named file —
+            # de-duplicate on the way in rather than silently overwrite one
+            # image with another.
+            candidate = src.name
+            counter = 1
+            while candidate in existing_names:
+                candidate = f"{src.stem}_{counter}{src.suffix}"
+                counter += 1
+            shutil.copy2(src, dest_dir / candidate)
+            existing_names.add(candidate)
+            already_copied.add(str(src.resolve()))
+            progress_bar.progress(i / total, text=f"Copying images from '{label}'... ({i}/{total})")
+        progress_bar.empty()
+
+    if total == 0 and skipped_count > 0:
+        # Explicit, unambiguous message for the "nothing new" case — the
+        # de-dup safeguard is deliberate (see docstring), but a silent
+        # "0 copied" would look identical to something actually failing.
+        message = (
+            f"0 new images copied from '{label}' — all {skipped_count} were "
+            f"already copied to this folder earlier this session. Delete "
+            f"them from the destination folder yourself if you want a "
+            f"fresh copy."
+        )
+    else:
+        message = f"Copied {total} images from '{label}' to {dest_dir}"
+        if skipped_count:
+            message += f" ({skipped_count} already copied here before, skipped)."
+    return message
+
+
 @st.dialog("Axis images", width="large", dismissible=False)
 def show_axis_images_dialog(label: str, embeddings, axes, paths, other_threshold: float) -> None:
+    # Close button rendered FIRST, unconditionally, before any other logic
+    # — guarantees there's always a manual way to close this dialog, no
+    # matter what state led to it being open. The automatic self-close
+    # rerun below (for when the Close button itself was clicked) has
+    # proven unreliable in some environments, so this is the real safety
+    # net, not just a nicety.
+    header_col, close_col = st.columns([10, 1])
+    with close_col:
+        st.button("✕", key="close_axis_dialog", on_click=_close_axis_dialog, help="Close")
+
     if st.session_state.viewing_axis != label:
         # We've been asked to close (Close button already cleared
-        # viewing_axis via its callback). A normal rerun triggered from
-        # inside a dialog only re-runs the dialog itself (it behaves like
-        # a fragment), which would just redraw this same content — so we
+        # viewing_axis via its callback), or something else cleared it
+        # out from under us. A normal rerun triggered from inside a
+        # dialog only re-runs the dialog itself (it behaves like a
+        # fragment), which would just redraw this same content — so we
         # force a full app-level rerun instead, which re-checks the
         # top-level "should this dialog even be shown" condition and
-        # actually closes it.
+        # actually closes it. If that somehow doesn't take effect, the
+        # Close button above still works as a manual fallback.
         st.rerun(scope="app")
         return
 
@@ -283,15 +359,12 @@ def show_axis_images_dialog(label: str, embeddings, axes, paths, other_threshold
     total = len(ranked)
     shown = min(st.session_state.thumb_shown_count, total)
 
-    header_col, close_col = st.columns([10, 1])
     with header_col:
         st.subheader(label)
         if label == OTHER_LABEL:
             st.caption(f"{total} images — ordered worst-fit first (clearest outliers)")
         else:
             st.caption(f"{total} images — ordered by similarity to the axis, closest first")
-    with close_col:
-        st.button("✕", key="close_axis_dialog", on_click=_close_axis_dialog, help="Close")
 
     if st.session_state.zoomed_image_path:
         st.button("◀ Back to grid", key="back_to_grid", on_click=_unzoom_image)
@@ -341,7 +414,7 @@ path = st.text_input(
     help="Any local folder — subfolders are searched too. Nothing is copied.",
 )
 
-with st.expander("Compare with a second feed"):
+with st.expander("Compare with a second feed (optional)"):
     st.caption(
         "The comparison feed doesn't get its own axes — its images are scored "
         "against the axes of the primary feed above, so the radar shows how "
@@ -442,6 +515,7 @@ if result is not None:
         max_value=1.0,
         value=0.90,
         step=0.1,
+        key="other_threshold_slider",
         help=(
             "How confidently an image must match its best axis to count there. "
             "Higher = stricter (more images end up in 'Other'). "
@@ -585,6 +659,17 @@ if result is not None:
 
     st.subheader("Axes")
     st.caption("Click 'View images' to browse the images behind any axis.")
+    st.caption(
+        "Tip: close any open 'View images' window before using "
+        "'Copy images to...' — the two aren't meant to be used at the "
+        "same time."
+    )
+    # Read the destination value already stored in session_state (set by
+    # the text_input rendered at the END of this block, below) —
+    # Streamlit widget values persist in session_state across reruns, so
+    # this is safe to read here even though the widget itself appears
+    # later on the page.
+    copy_destination = st.session_state.get("copy_destination_input", "")
     for label, count in sorted(axis_counts.items(), key=lambda item: -item[1]):
         if label == OTHER_LABEL:
             tag = " _(unclassified — no clear match)_"
@@ -594,15 +679,39 @@ if result is not None:
             tag = ""
         is_removable_auto_axis = label != OTHER_LABEL and label not in st.session_state.custom_axis_labels
         if is_removable_auto_axis:
-            c1, c2, c3 = st.columns([3.3, 1.3, 1])
+            c1, c2, c3, c4 = st.columns([2.4, 1.3, 1.6, 1])
         else:
-            c1, c2 = st.columns([4, 1.3])
+            c1, c2, c3 = st.columns([3.2, 1.3, 1.6])
         c1.write(f"- **{label}**{tag} — {count} images")
         c2.button("View images", key=f"view_{label}", on_click=_open_axis_dialog, args=(label,))
+        if c3.button("Copy images to...", key=f"copy_{label}"):
+            if not copy_destination:
+                st.error("Enter a destination folder below first.")
+            else:
+                message = _copy_axis_images_to(
+                    label,
+                    copy_destination,
+                    result["embeddings"],
+                    full_axes,
+                    result["paths"],
+                    other_threshold,
+                )
+                st.success(message)
         if is_removable_auto_axis:
-            if c3.button("Remove", key=f"remove_auto_{label}"):
+            if c4.button("Remove", key=f"remove_auto_{label}"):
                 st.session_state.excluded_axis_labels.add(label)
                 st.rerun()
+
+    st.text_input(
+        "Copy destination folder",
+        key="copy_destination_input",
+        placeholder=r"E:\dataset_samples\sample_01",
+        help="Used by every 'Copy images to...' button above — set it "
+        "once, then click 'Copy images to...' on as many axes as you "
+        "like; they all land in this same folder (created automatically "
+        "if it doesn't exist yet). Change this to start filling a "
+        "different folder instead.",
+    )
 
     if st.session_state.excluded_axis_labels:
         with st.expander(f"Excluded axes ({len(st.session_state.excluded_axis_labels)})"):
