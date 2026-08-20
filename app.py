@@ -30,6 +30,8 @@ import pillow_heif
 import streamlit as st
 from PIL import Image, ImageOps
 
+import numpy as np
+
 # Registers HEIC/HEIF as an opener Pillow understands — must happen before
 # any Image.open() call on such a file. Safe to call multiple times.
 pillow_heif.register_heif_opener()
@@ -49,7 +51,7 @@ from src.scoring.scoring import (
 )
 from src.viz.radar import build_radar_figure, build_stacked_radar_figure
 from src.viz.scatter import build_scatter_figure
-from src.viz.tsne_projection import get_or_compute_tsne
+from src.viz.tsne_projection import compute_tsne_projection, get_or_compute_tsne
 from src.similarity.phash import (
     DEFAULT_CHAIN_MAX_LENGTH,
     DEFAULT_GROUP_THRESHOLD_BITS,
@@ -63,7 +65,7 @@ from src.similarity.phash import (
 from src.report.metrics import compute_overview_metrics, get_representative_images_by_axis
 from src.report.pdf_report import generate_pdf_report
 from src.scoring.dataset_similarity import compute_clip_mmd, compute_self_split_mmd
-from src.viz.umap_projection import get_or_compute_umap
+from src.viz.umap_projection import compute_umap_projection, get_or_compute_umap
 
 MAX_AXES = 25  # soft cap for the + button; raising axis count re-runs captioning
 THUMB_BATCH_SIZE = 24  # how many more thumbnails "Load more" reveals each click
@@ -113,6 +115,8 @@ if "excluded_axis_labels" not in st.session_state:
     st.session_state.excluded_axis_labels = set()
 if "viewing_axis" not in st.session_state:
     st.session_state.viewing_axis = None
+if "viewing_axis_scope" not in st.session_state:
+    st.session_state.viewing_axis_scope = "primary"
 if "thumb_shown_count" not in st.session_state:
     st.session_state.thumb_shown_count = THUMB_BATCH_SIZE
 if "zoomed_image_path" not in st.session_state:
@@ -139,6 +143,16 @@ if "scatter_cluster_numbers" not in st.session_state:
     st.session_state.scatter_cluster_numbers = None
 if "scatter_similarities" not in st.session_state:
     st.session_state.scatter_similarities = None
+if "scatter_paths" not in st.session_state:
+    st.session_state.scatter_paths = None
+if "scatter_dataset_origin" not in st.session_state:
+    # None = single dataset. Otherwise a "primary"/"comparison" list,
+    # same length/order as the other scatter_* arrays — see the Scatter
+    # view section for how this feeds build_scatter_figure's dataset
+    # legend/marker-shape logic.
+    st.session_state.scatter_dataset_origin = None
+if "scatter_dataset_display_names" not in st.session_state:
+    st.session_state.scatter_dataset_display_names = None
 if "copied_sources" not in st.session_state:
     # dest folder (resolved absolute path string) -> set of resolved source
     # image paths already copied there this session, so re-copying an axis
@@ -184,8 +198,16 @@ def run_analysis(path: str, k: int, linkage_method: str) -> None:
     st.session_state.viewing_axis = None
 
 
-def _open_axis_dialog(label: str) -> None:
+def _open_axis_dialog(label: str, scope: str = "primary") -> None:
+    """
+    scope: "primary" (default — every existing call site keeps this,
+    unchanged behavior), "comparison" (Separated mode's second row —
+    reuses this same dialog with the comparison feed's data instead, no
+    new dialog logic needed for that), or "aggregated" (Aggregated mode —
+    shows both datasets' images together, tagged by origin).
+    """
     st.session_state.viewing_axis = label
+    st.session_state.viewing_axis_scope = scope
     st.session_state.thumb_shown_count = THUMB_BATCH_SIZE
 
 
@@ -272,6 +294,74 @@ def show_single_image_dialog(info: dict) -> None:
     )
 
 
+def _score_and_pool_for_scatter(result, compare_result, full_axes, other_threshold):
+    """
+    Shared by the live Scatter view and the PDF's UMAP page: scores every
+    image (the primary feed, and the comparison feed too if one is
+    loaded) against `full_axes`, and — when comparing — prepares the
+    pooled embeddings/paths/dataset-origin arrays needed to project both
+    feeds onto the same 2D space together (t-SNE has no way to place new
+    points into an already-fit projection, so both datasets need to go
+    through projection together, not one after the other).
+
+    Returns (embeddings_for_projection, dominant_labels, cluster_numbers,
+    similarities, paths, dataset_origin, dataset_display_names) — the
+    caller still has to actually run the projection (t-SNE/UMAP) on the
+    returned embeddings. dataset_origin/dataset_display_names are None
+    when there's no comparison feed loaded (single dataset).
+    """
+    axis_index_by_label = {axis.label: i + 1 for i, axis in enumerate(full_axes)}
+
+    def _score_against_axes(embeddings_arr):
+        dom_labels, score_mat, _ = get_dominant_labels(
+            embeddings_arr, full_axes, other_threshold=other_threshold
+        )
+        clusters, sims = [], []
+        for i, lbl in enumerate(dom_labels):
+            if lbl == OTHER_LABEL:
+                clusters.append(0)
+                sims.append(float(score_mat[i].max()))
+            else:
+                axis_idx = axis_index_by_label[lbl]
+                clusters.append(axis_idx)
+                sims.append(float(score_mat[i, axis_idx - 1]))
+        return list(dom_labels), clusters, sims
+
+    if compare_result is None:
+        dominant_labels, cluster_numbers, similarities = _score_against_axes(result["embeddings"])
+        return (
+            result["embeddings"],
+            dominant_labels,
+            cluster_numbers,
+            similarities,
+            list(result["paths"]),
+            None,
+            None,
+        )
+
+    pooled_embeddings = np.concatenate([result["embeddings"], compare_result["embeddings"]], axis=0)
+    primary_labels, primary_clusters, primary_sims = _score_against_axes(result["embeddings"])
+    compare_labels, compare_clusters, compare_sims = _score_against_axes(compare_result["embeddings"])
+    dominant_labels = primary_labels + compare_labels
+    cluster_numbers = primary_clusters + compare_clusters
+    similarities = primary_sims + compare_sims
+    all_paths = list(result["paths"]) + list(compare_result["paths"])
+    dataset_origin = ["primary"] * len(result["paths"]) + ["comparison"] * len(compare_result["paths"])
+    dataset_display_names = {
+        "primary": result["dataset_name"],
+        "comparison": compare_result["dataset_name"],
+    }
+    return (
+        pooled_embeddings,
+        dominant_labels,
+        cluster_numbers,
+        similarities,
+        all_paths,
+        dataset_origin,
+        dataset_display_names,
+    )
+
+
 def _copy_axis_images_to(label: str, dest_folder: str, embeddings, axes, paths, other_threshold: float) -> str:
     """
     Copies every image currently assigned to `label` into dest_folder
@@ -330,8 +420,51 @@ def _copy_axis_images_to(label: str, dest_folder: str, embeddings, axes, paths, 
     return message
 
 
+def _copy_axis_images_to_aggregated(
+    label: str, dest_folder: str, result, compare_result, full_axes, other_threshold: float
+) -> str:
+    """
+    Aggregated-mode "Copy images to..." — copies this axis's images from
+    BOTH datasets into the same destination folder. Just calls the
+    existing single-dataset _copy_axis_images_to twice in sequence (once
+    per dataset) rather than a new merged code path — that function's
+    de-duplication is already keyed by each image's own source path, so
+    calling it back-to-back for two different datasets is safe as-is; no
+    changes needed there.
+    """
+    msg_primary = _copy_axis_images_to(
+        label, dest_folder, result["embeddings"], full_axes, result["paths"], other_threshold
+    )
+    msg_compare = _copy_axis_images_to(
+        label, dest_folder, compare_result["embeddings"], full_axes, compare_result["paths"], other_threshold
+    )
+    return f"{result['dataset_name']}: {msg_primary}\n{compare_result['dataset_name']}: {msg_compare}"
+
+
 @st.dialog("Axis images", width="large", dismissible=False)
-def show_axis_images_dialog(label: str, embeddings, axes, paths, other_threshold: float) -> None:
+def show_axis_images_dialog(
+    label: str,
+    embeddings,
+    axes,
+    paths,
+    other_threshold: float,
+    extra_source: dict | None = None,
+    primary_dataset_name: str | None = None,
+) -> None:
+    """
+    extra_source / primary_dataset_name are only used by Aggregated-mode
+    comparisons (see _open_axis_dialog's "aggregated" scope) — every
+    existing call site omits them, which keeps this function's behavior
+    completely unchanged from before: extra_source=None means no second
+    dataset gets merged in, and primary_dataset_name=None means no
+    per-image dataset tag gets added to captions.
+
+    extra_source, when given: {"embeddings", "paths", "dataset_name"} for
+    the SECOND dataset — scored against the same `axes`/`other_threshold`
+    as the primary, then its ranked images are appended after the
+    primary's own (not interleaved by score — simplest predictable
+    ordering: this dataset's images first, then the other's).
+    """
     # Close button rendered FIRST, unconditionally, before any other logic
     # — guarantees there's always a manual way to close this dialog, no
     # matter what state led to it being open. The automatic self-close
@@ -356,7 +489,18 @@ def show_axis_images_dialog(label: str, embeddings, axes, paths, other_threshold
         return
 
     ranked = get_ranked_images_for_axis(embeddings, axes, paths, label, other_threshold=other_threshold)
-    total = len(ranked)
+    # (path, score, dataset name or None) — the dataset name stays None
+    # for every entry in the single-dataset case (extra_source is None,
+    # primary_dataset_name typically None too), which keeps captions
+    # below in their original, unchanged format.
+    tagged = [(p, s, primary_dataset_name) for p, s in ranked]
+    if extra_source is not None:
+        compare_ranked = get_ranked_images_for_axis(
+            extra_source["embeddings"], axes, extra_source["paths"], label, other_threshold=other_threshold
+        )
+        tagged += [(p, s, extra_source["dataset_name"]) for p, s in compare_ranked]
+
+    total = len(tagged)
     shown = min(st.session_state.thumb_shown_count, total)
 
     with header_col:
@@ -365,6 +509,8 @@ def show_axis_images_dialog(label: str, embeddings, axes, paths, other_threshold
             st.caption(f"{total} images — ordered worst-fit first (clearest outliers)")
         else:
             st.caption(f"{total} images — ordered by similarity to the axis, closest first")
+        if extra_source is not None:
+            st.caption(f"🔵 {primary_dataset_name}   🟠 {extra_source['dataset_name']}")
 
     if st.session_state.zoomed_image_path:
         st.button("◀ Back to grid", key="back_to_grid", on_click=_unzoom_image)
@@ -378,16 +524,20 @@ def show_axis_images_dialog(label: str, embeddings, axes, paths, other_threshold
                 st.error(f"Couldn't load {st.session_state.zoomed_image_path}")
         return
 
-    visible = ranked[:shown]
+    visible = tagged[:shown]
     for row_start in range(0, len(visible), THUMB_COLUMNS):
         row_items = visible[row_start : row_start + THUMB_COLUMNS]
         cols = st.columns(THUMB_COLUMNS)
-        for col, (img_path, score) in zip(cols, row_items):
+        for col, (img_path, score, ds_name) in zip(cols, row_items):
             with col:
                 try:
                     with Image.open(img_path) as im:
                         im = ImageOps.exif_transpose(im)
-                        st.image(im, width="stretch", caption=f"similarity: {score:.3f}")
+                        caption = f"similarity: {score:.3f}"
+                        if ds_name is not None:
+                            dot = "🔵" if ds_name == primary_dataset_name else "🟠"
+                            caption = f"{dot} {ds_name} · {caption}"
+                        st.image(im, width="stretch", caption=caption)
                     st.button(
                         "🔍 View full size",
                         key=f"zoom_{img_path}",
@@ -649,58 +799,206 @@ if result is not None:
     )
 
     if st.session_state.viewing_axis:
-        show_axis_images_dialog(
-            st.session_state.viewing_axis,
-            result["embeddings"],
-            full_axes,
-            result["paths"],
-            other_threshold,
-        )
+        scope = st.session_state.viewing_axis_scope
+        if scope == "comparison" and compare_result is not None:
+            # Separated mode's second row — same dialog, just fed the
+            # comparison feed's own data instead. No new dialog logic
+            # needed for this case at all.
+            show_axis_images_dialog(
+                st.session_state.viewing_axis,
+                compare_result["embeddings"],
+                full_axes,
+                compare_result["paths"],
+                other_threshold,
+            )
+        elif scope == "aggregated" and compare_result is not None:
+            show_axis_images_dialog(
+                st.session_state.viewing_axis,
+                result["embeddings"],
+                full_axes,
+                result["paths"],
+                other_threshold,
+                extra_source={
+                    "embeddings": compare_result["embeddings"],
+                    "paths": compare_result["paths"],
+                    "dataset_name": compare_result["dataset_name"],
+                },
+                primary_dataset_name=result["dataset_name"],
+            )
+        else:
+            show_axis_images_dialog(
+                st.session_state.viewing_axis,
+                result["embeddings"],
+                full_axes,
+                result["paths"],
+                other_threshold,
+            )
 
     st.subheader("Axes")
     st.caption("Click 'View images' to browse the images behind any axis.")
+    st.caption(
+        "'Remove axis' only removes that axis from the radar/scatter/PDF "
+        "— it never deletes or modifies any of your image files."
+    )
     st.caption(
         "Tip: close any open 'View images' window before using "
         "'Copy images to...' — the two aren't meant to be used at the "
         "same time."
     )
+
+    # Comparison-only controls: only shown/computed when a second feed is
+    # loaded — with a single dataset, "Aggregated" is the only meaningful
+    # mode anyway, so the toggle would be a no-op distraction.
+    compare_axis_counts: dict[str, int] = {}
+    aggregation_mode = "Aggregated"
+    if compare_result is not None:
+        compare_axis_counts = get_axis_counts_by_dominance(
+            compare_result["embeddings"], full_axes, other_threshold=other_threshold
+        )
+        aggregation_mode = st.radio(
+            "Datasets",
+            options=["Aggregated", "Separated"],
+            horizontal=True,
+            key="axes_aggregation_mode",
+            help=(
+                "'Aggregated' combines both datasets into one row per axis "
+                "(counts summed; View images/Copy images act on both at "
+                "once, tagged 🔵/🟠 by origin). 'Separated' shows each "
+                "dataset in its own row, with its own dedicated View/Copy "
+                "buttons acting only on that one dataset."
+            ),
+        )
+
     # Read the destination value already stored in session_state (set by
     # the text_input rendered at the END of this block, below) —
     # Streamlit widget values persist in session_state across reruns, so
     # this is safe to read here even though the widget itself appears
     # later on the page.
     copy_destination = st.session_state.get("copy_destination_input", "")
-    for label, count in sorted(axis_counts.items(), key=lambda item: -item[1]):
-        if label == OTHER_LABEL:
-            tag = " _(unclassified — no clear match)_"
-        elif label in st.session_state.custom_axis_labels:
-            tag = " _(custom)_"
-        else:
-            tag = ""
-        is_removable_auto_axis = label != OTHER_LABEL and label not in st.session_state.custom_axis_labels
-        if is_removable_auto_axis:
-            c1, c2, c3, c4 = st.columns([2.4, 1.3, 1.6, 1])
-        else:
-            c1, c2, c3 = st.columns([3.2, 1.3, 1.6])
-        c1.write(f"- **{label}**{tag} — {count} images")
-        c2.button("View images", key=f"view_{label}", on_click=_open_axis_dialog, args=(label,))
-        if c3.button("Copy images to...", key=f"copy_{label}"):
-            if not copy_destination:
-                st.error("Enter a destination folder below first.")
-            else:
-                message = _copy_axis_images_to(
-                    label,
-                    copy_destination,
-                    result["embeddings"],
-                    full_axes,
-                    result["paths"],
-                    other_threshold,
+
+    # Sort by TOTAL count (both datasets combined when comparing, so the
+    # row order doesn't jump around between Aggregated/Separated) — same
+    # descending-by-size convention as before.
+    combined_counts_for_sort = {
+        lbl: axis_counts.get(lbl, 0) + compare_axis_counts.get(lbl, 0)
+        for lbl in set(axis_counts) | set(compare_axis_counts)
+    }
+    sorted_labels = [lbl for lbl, _ in sorted(combined_counts_for_sort.items(), key=lambda item: -item[1])]
+
+    separated = compare_result is not None and aggregation_mode == "Separated"
+
+    # Two SEPARATE, always-present placeholders (not one shared container
+    # that swaps its whole content type) — each mode renders into its own
+    # placeholder and explicitly empties the OTHER one first. This avoids
+    # asking Streamlit to reconcile two very differently-shaped widget
+    # trees against each other on a mode switch, which is what caused
+    # "ghost" dimmed leftover buttons to briefly appear (worse still
+    # while other slow sections like the scatter/similarity chain hadn't
+    # finished their own first computation yet).
+    aggregated_placeholder = st.empty()
+    separated_placeholder = st.empty()
+
+    if not separated:
+        separated_placeholder.empty()
+        with aggregated_placeholder.container():
+            for label in sorted_labels:
+                if label == OTHER_LABEL:
+                    tag = " _(unclassified — no clear match)_"
+                elif label in st.session_state.custom_axis_labels:
+                    tag = " _(custom)_"
+                else:
+                    tag = ""
+                is_removable_auto_axis = (
+                    label != OTHER_LABEL and label not in st.session_state.custom_axis_labels
                 )
-                st.toast(message, icon="✅")
-        if is_removable_auto_axis:
-            if c4.button("Remove", key=f"remove_auto_{label}"):
-                st.session_state.excluded_axis_labels.add(label)
-                st.rerun()
+
+                count = axis_counts.get(label, 0) + compare_axis_counts.get(label, 0)
+                c1, c2, c3, c4 = st.columns([2.4, 1.3, 1.6, 1])
+                c1.write(f"- **{label}**{tag} — {count} images")
+                c2.button(
+                    "View images",
+                    key=f"view_{label}",
+                    on_click=_open_axis_dialog,
+                    args=(label, "aggregated" if compare_result is not None else "primary"),
+                )
+                if c3.button("Copy images to...", key=f"copy_{label}"):
+                    if not copy_destination:
+                        st.error("Enter a destination folder below first.")
+                    elif compare_result is not None:
+                        message = _copy_axis_images_to_aggregated(
+                            label, copy_destination, result, compare_result, full_axes, other_threshold
+                        )
+                        st.toast(message, icon="✅")
+                    else:
+                        message = _copy_axis_images_to(
+                            label, copy_destination, result["embeddings"], full_axes, result["paths"], other_threshold
+                        )
+                        st.toast(message, icon="✅")
+                if is_removable_auto_axis:
+                    if c4.button("Remove axis", key=f"remove_auto_{label}"):
+                        st.session_state.excluded_axis_labels.add(label)
+                        st.rerun()
+    else:
+        aggregated_placeholder.empty()
+        with separated_placeholder.container():
+            for label in sorted_labels:
+                if label == OTHER_LABEL:
+                    tag = " _(unclassified — no clear match)_"
+                elif label in st.session_state.custom_axis_labels:
+                    tag = " _(custom)_"
+                else:
+                    tag = ""
+                is_removable_auto_axis = (
+                    label != OTHER_LABEL and label not in st.session_state.custom_axis_labels
+                )
+
+                with st.container(border=True):
+                    primary_count = axis_counts.get(label, 0)
+                    c1, c2, c3, c4 = st.columns([2.4, 1.3, 1.6, 1])
+                    c1.write(f"🔵 **{label}**{tag} — {primary_count} images ({result['dataset_name']})")
+                    c2.button(
+                        "View images",
+                        key=f"view_{label}_primary",
+                        on_click=_open_axis_dialog,
+                        args=(label, "primary"),
+                    )
+                    if c3.button("Copy images to...", key=f"copy_{label}_primary"):
+                        if not copy_destination:
+                            st.error("Enter a destination folder below first.")
+                        else:
+                            message = _copy_axis_images_to(
+                                label, copy_destination, result["embeddings"], full_axes, result["paths"], other_threshold
+                            )
+                            st.toast(message, icon="✅")
+                    if is_removable_auto_axis:
+                        if c4.button("Remove axis", key=f"remove_auto_{label}_shared"):
+                            st.session_state.excluded_axis_labels.add(label)
+                            st.rerun()
+
+                    compare_count = compare_axis_counts.get(label, 0)
+                    c1b, c2b, c3b, c4b = st.columns([2.4, 1.3, 1.6, 1])
+                    c1b.write(f"🟠 **{label}**{tag} — {compare_count} images ({compare_result['dataset_name']})")
+                    c2b.button(
+                        "View images",
+                        key=f"view_{label}_compare",
+                        on_click=_open_axis_dialog,
+                        args=(label, "comparison"),
+                    )
+                    if c3b.button("Copy images to...", key=f"copy_{label}_compare"):
+                        if not copy_destination:
+                            st.error("Enter a destination folder below first.")
+                        else:
+                            message = _copy_axis_images_to(
+                                label,
+                                copy_destination,
+                                compare_result["embeddings"],
+                                full_axes,
+                                compare_result["paths"],
+                                other_threshold,
+                            )
+                            st.toast(message, icon="✅")
+                    # c4b intentionally left blank — Remove axis already shown
+                    # once above, applies to both rows.
 
     st.text_input(
         "Copy destination folder",
@@ -754,7 +1052,7 @@ if result is not None:
                 on_click=_open_axis_dialog,
                 args=(label,),
             )
-            if c3.button("Remove", key=f"remove_{label}"):
+            if c3.button("Remove axis", key=f"remove_{label}"):
                 st.session_state.custom_axis_labels.remove(label)
                 st.rerun()
 
@@ -785,51 +1083,71 @@ if result is not None:
     # unrelated rerun — e.g. closing a dialog anywhere else on the page —
     # made the whole app feel sluggish. Memoize it in session_state, same
     # pattern as the Visual similarity chain section below: only recompute
-    # when ITS OWN parameters actually change.
+    # when ITS OWN parameters actually change — including whether a
+    # comparison feed is loaded, and which one, since that changes what
+    # gets plotted entirely (see below).
     scatter_cache_key = (
         result["path"],
         projection_method,
         other_threshold,
         tuple(axis.label for axis in full_axes),
+        compare_result["path"] if compare_result is not None else None,
     )
     if st.session_state.get("scatter_data_cache_key") != scatter_cache_key:
         with st.spinner(
             "Computing projection — this can take a while the first time, "
-            "then it's cached for this dataset."
+            "then it's cached for this session."
         ):
-            if projection_method == "t-SNE":
-                coords = get_or_compute_tsne(result["path"], result["embeddings"])
-            else:
-                coords = get_or_compute_umap(result["path"], result["embeddings"])
-            dominant_labels, score_matrix, _ = get_dominant_labels(
-                result["embeddings"], full_axes, other_threshold=other_threshold
-            )
+            (
+                embeddings_for_projection,
+                dominant_labels,
+                cluster_numbers,
+                similarities,
+                all_paths,
+                dataset_origin,
+                dataset_display_names,
+            ) = _score_and_pool_for_scatter(result, compare_result, full_axes, other_threshold)
 
-        # Cluster display number: 1-based position among the active axes (0
-        # for "Other", which has no real axis/centroid of its own).
-        # Similarity is each image's raw score against its OWN dominant axis.
-        axis_index_by_label = {axis.label: i + 1 for i, axis in enumerate(full_axes)}
-        cluster_numbers = []
-        similarities = []
-        for i, lbl in enumerate(dominant_labels):
-            if lbl == OTHER_LABEL:
-                cluster_numbers.append(0)
-                similarities.append(float(score_matrix[i].max()))
+            if compare_result is None:
+                # Single dataset — use the disk-cached projection tied to
+                # this dataset's own path.
+                if projection_method == "t-SNE":
+                    coords = get_or_compute_tsne(result["path"], embeddings_for_projection)
+                else:
+                    coords = get_or_compute_umap(result["path"], embeddings_for_projection)
             else:
-                axis_idx = axis_index_by_label[lbl]
-                cluster_numbers.append(axis_idx)
-                similarities.append(float(score_matrix[i, axis_idx - 1]))
+                # Two datasets — project them TOGETHER so their points are
+                # spatially comparable in the same 2D space. t-SNE has no
+                # way to place new points into an already-fit projection
+                # (no .transform()), so both methods are computed fresh on
+                # the pooled embeddings here — this deliberately does NOT
+                # use the disk-cached get_or_compute_* wrappers (those are
+                # keyed by the primary dataset's own path, and writing a
+                # combined-dataset result under that same key could poison
+                # the cache for future single-dataset runs). Session-state
+                # memoization above (scatter_cache_key) still avoids
+                # recomputing this on every unrelated rerun.
+                if projection_method == "t-SNE":
+                    coords = compute_tsne_projection(embeddings_for_projection)
+                else:
+                    coords = compute_umap_projection(embeddings_for_projection)
 
         st.session_state.scatter_data_cache_key = scatter_cache_key
         st.session_state.scatter_coords = coords
         st.session_state.scatter_dominant_labels = dominant_labels
         st.session_state.scatter_cluster_numbers = cluster_numbers
         st.session_state.scatter_similarities = similarities
+        st.session_state.scatter_paths = all_paths
+        st.session_state.scatter_dataset_origin = dataset_origin
+        st.session_state.scatter_dataset_display_names = dataset_display_names
 
     coords = st.session_state.scatter_coords
     dominant_labels = st.session_state.scatter_dominant_labels
     cluster_numbers = st.session_state.scatter_cluster_numbers
     similarities = st.session_state.scatter_similarities
+    scatter_paths = st.session_state.scatter_paths
+    dataset_origin = st.session_state.scatter_dataset_origin
+    dataset_display_names = st.session_state.scatter_dataset_display_names
 
     axis_filter = st.selectbox(
         "Filter by axis",
@@ -838,15 +1156,18 @@ if result is not None:
     )
 
     if axis_filter == "All axes":
-        filtered_indices = list(range(len(result["paths"])))
+        filtered_indices = list(range(len(scatter_paths)))
     else:
         filtered_indices = [i for i, lbl in enumerate(dominant_labels) if lbl == axis_filter]
 
     filtered_coords = coords[filtered_indices]
-    filtered_paths = [result["paths"][i] for i in filtered_indices]
+    filtered_paths = [scatter_paths[i] for i in filtered_indices]
     filtered_labels = [dominant_labels[i] for i in filtered_indices]
     filtered_similarities = [similarities[i] for i in filtered_indices]
     filtered_clusters = [cluster_numbers[i] for i in filtered_indices]
+    filtered_origin = (
+        [dataset_origin[i] for i in filtered_indices] if dataset_origin is not None else None
+    )
 
     scatter_fig = build_scatter_figure(
         filtered_coords,
@@ -854,6 +1175,8 @@ if result is not None:
         filtered_paths,
         filtered_similarities,
         filtered_clusters,
+        dataset_origin=filtered_origin,
+        dataset_display_names=dataset_display_names,
         title=f"{projection_method} — {result['dataset_name']}",
     )
     scatter_event = st.plotly_chart(
@@ -1029,6 +1352,26 @@ if result is not None:
                 total_images=len(result["paths"]),
                 duplicate_image_count=duplicate_stats["n_duplicate_images"],
             )
+
+            # Same overview metrics for the comparison feed, when loaded —
+            # its own pHash/duplicate-detection pass, cached per-dataset
+            # exactly like the primary's above. Used to show the KPI
+            # cards/bar chart broken down by dataset instead of only the
+            # primary feed's own numbers.
+            overview_compare = None
+            if compare_result is not None:
+                compare_report_phashes = get_or_compute_phashes(
+                    compare_result["path"], compare_result["paths"]
+                )
+                compare_duplicate_stats = get_or_compute_duplicate_stats(
+                    compare_result["path"], compare_result["paths"], compare_report_phashes
+                )
+                overview_compare = compute_overview_metrics(
+                    axis_counts=compare_axis_counts,
+                    total_images=len(compare_result["paths"]),
+                    duplicate_image_count=compare_duplicate_stats["n_duplicate_images"],
+                )
+
             representative_pairs = get_representative_images_by_axis(full_axes)
             # Custom axes have no centroid image of their own — fall back to
             # a random image that actually dominates that axis, so every
@@ -1076,13 +1419,53 @@ if result is not None:
                 label: v for label, v in radar_normalized_values.items() if label != OTHER_LABEL
             }
 
+            # Same two variants for the comparison feed, when loaded —
+            # scored against the SAME full_axes as the primary feed (it
+            # never gets its own clustering), same pattern as the live
+            # radar's overlay above.
+            radar_dominance_values_compare = None
+            radar_normalized_values_compare = None
+            if compare_result is not None:
+                radar_dominance_values_compare = get_radar_values_by_dominance(
+                    compare_result["embeddings"], full_axes, other_threshold=other_threshold
+                )
+                radar_dominance_values_compare = {
+                    label: v
+                    for label, v in radar_dominance_values_compare.items()
+                    if label != OTHER_LABEL
+                }
+                radar_normalized_values_compare = get_radar_values_normalized(
+                    compare_result["embeddings"], full_axes
+                )
+                radar_normalized_values_compare = {
+                    label: v
+                    for label, v in radar_normalized_values_compare.items()
+                    if label != OTHER_LABEL
+                }
+
             # UMAP — computed on the fly if not already cached (per your
             # preference); can take a while the first time on a large
-            # dataset, but is cached afterward like everywhere else.
-            umap_coords = get_or_compute_umap(result["path"], result["embeddings"])
-            umap_dominant_labels, _, _ = get_dominant_labels(
-                result["embeddings"], full_axes, other_threshold=other_threshold
-            )
+            # dataset, but is cached afterward like everywhere else. When a
+            # comparison feed is loaded, both feeds are pooled and
+            # projected together (same shared logic as the live Scatter
+            # view) so the PDF's scatter shows both, shaped by dataset —
+            # this deliberately bypasses the disk cache in that case, same
+            # reasoning as the live view (keyed by the primary dataset's
+            # own path; a pooled result under that key could poison future
+            # single-dataset runs).
+            (
+                umap_embeddings_for_projection,
+                umap_dominant_labels,
+                _umap_cluster_numbers,
+                _umap_similarities,
+                _umap_paths,
+                umap_dataset_origin,
+                umap_dataset_display_names,
+            ) = _score_and_pool_for_scatter(result, compare_result, full_axes, other_threshold)
+            if compare_result is None:
+                umap_coords = get_or_compute_umap(result["path"], umap_embeddings_for_projection)
+            else:
+                umap_coords = compute_umap_projection(umap_embeddings_for_projection)
 
             # CLIP-MMD — a single "how similar overall" number between the
             # two feeds, only when a comparison feed is loaded. Reuses the
@@ -1107,11 +1490,16 @@ if result is not None:
                 duplicate_samples=duplicate_samples,
                 radar_dominance_values=radar_dominance_values,
                 radar_normalized_values=radar_normalized_values,
+                radar_dominance_values_compare=radar_dominance_values_compare,
+                radar_normalized_values_compare=radar_normalized_values_compare,
                 umap_coords=umap_coords,
                 umap_labels=umap_dominant_labels,
+                umap_dataset_origin=umap_dataset_origin,
+                umap_dataset_display_names=umap_dataset_display_names,
                 clip_mmd=clip_mmd_value,
                 clip_mmd_baseline=clip_mmd_baseline_value,
                 compare_dataset_name=compare_dataset_name,
+                overview_compare=overview_compare,
             )
 
     if st.session_state.pdf_report_bytes:

@@ -86,6 +86,11 @@ MPL_NEUTRAL_600 = "#7A7A7D"
 MPL_ACCENT = "#5980A6"
 MPL_ACCENT_200 = "#D6EBFF"
 MPL_ACCENT_800 = "#2C455D"
+# Second accent, used only where two datasets are plotted together (radar/
+# scatter comparison pages) — needs to read clearly against the steel-blue
+# MPL_ACCENT family above, not blend into it.
+MPL_ACCENT_COMPARE = "#D97B29"
+MPL_ACCENT_COMPARE_800 = "#8A4E15"
 
 PAGE_MARGIN = 0.65 * inch
 PORTRAIT_SIZE = letter
@@ -363,24 +368,57 @@ def _section_header(text: str, styles: dict, width: float) -> Table:
     return head
 
 
-def _metric_card(value: str, label: str, styles: dict) -> _Blueprint:
-    """One KPI 'card' — big number, small label underneath, framed as a
+def _metric_card(
+    value: str, label: str, styles: dict, breakdown: list[dict] | None = None
+) -> _Blueprint:
+    """
+    One KPI 'card' — big number, small label underneath, framed as a
     blueprint object (transparent, hairline border, corner marks) rather
-    than a filled gray box."""
-    inner = Table(
-        [[Paragraph(value, styles["card_value"])], [Paragraph(label.upper(), styles["card_label"])]],
-        colWidths=[1.5 * inch],
-    )
-    inner.setStyle(
-        TableStyle(
-            [
-                ("TOPPADDING", (0, 0), (-1, 0), 8),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 1),
-                ("TOPPADDING", (0, 1), (-1, 1), 1),
-                ("BOTTOMPADDING", (0, 1), (-1, 1), 8),
-            ]
-        )
-    )
+    than a filled gray box.
+
+    `breakdown`, if given, is a list of {"value": str, "color": hex} (one
+    entry per dataset being compared) — rendered as a row of smaller
+    colored numbers beneath the label, e.g. a big "480"/"TOTAL IMAGES"
+    with "400" (steel-blue) and "280" (amber) underneath it. None (the
+    default) renders exactly as before — a single big value and label,
+    no breakdown row — so every existing single-dataset call site is
+    completely unaffected.
+    """
+    n_cols = len(breakdown) if breakdown else 1
+    col_width = (1.5 * inch) / n_cols
+
+    rows = [
+        [Paragraph(value, styles["card_value"])] + [""] * (n_cols - 1),
+        [Paragraph(label.upper(), styles["card_label"])] + [""] * (n_cols - 1),
+    ]
+    style_commands = [
+        ("SPAN", (0, 0), (n_cols - 1, 0)),
+        ("SPAN", (0, 1), (n_cols - 1, 1)),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, 0), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 1),
+        ("TOPPADDING", (0, 1), (-1, 1), 1),
+        ("BOTTOMPADDING", (0, 1), (-1, 1), 8 if not breakdown else 2),
+    ]
+
+    if breakdown:
+        breakdown_row = []
+        for item in breakdown:
+            item_style = ParagraphStyle(
+                f"card_breakdown_{id(item)}",
+                parent=styles["card_label"],
+                fontSize=9,
+                textColor=colors.HexColor(item["color"]),
+            )
+            breakdown_row.append(Paragraph(item["value"], item_style))
+        rows.append(breakdown_row)
+        style_commands += [
+            ("TOPPADDING", (0, 2), (-1, 2), 0),
+            ("BOTTOMPADDING", (0, 2), (-1, 2), 8),
+        ]
+
+    inner = Table(rows, colWidths=[col_width] * n_cols)
+    inner.setStyle(TableStyle(style_commands))
     return _Blueprint(inner, pad=2, margin=7)
 
 
@@ -426,11 +464,94 @@ def _render_donut(
     return buf
 
 
-def _render_bar_chart(axis_sizes: dict[str, int]) -> io.BytesIO:
+def _render_donut_with_breakdown(
+    title: str,
+    combined_labels: list[str],
+    combined_values: list[float],
+    chart_colors: list[str],
+    per_dataset: list[dict],
+) -> io.BytesIO:
+    """
+    A big combined donut on top (same as _render_donut), with one smaller
+    donut per dataset stacked below it — same two-slice composition
+    (e.g. Classified/Unclassified), just computed for that ONE dataset —
+    all rendered into a single image so they fit inside one blueprint
+    frame together.
+
+    Colors are the SAME steel-blue/gray scheme across every donut here
+    (classified vs unclassified always means the same thing) — the
+    dataset accent colors (blue/amber) are deliberately NOT reused for
+    the mini donuts' own slices, since that would clash with what color
+    already means in this chart. Only the dataset NAME below each mini
+    donut identifies which is which.
+
+    per_dataset: list of {"name": str, "values": [v1, v2]} — same slice
+    order/meaning as combined_values, one entry per dataset.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
+    n_mini = len(per_dataset)
+    fig = plt.figure(figsize=(2.6, 2.85), dpi=200)
+    gs = fig.add_gridspec(2, n_mini, height_ratios=[1.7, 1.15], hspace=0.75)
+
+    ax_big = fig.add_subplot(gs[0, :])
+    wedges, _ = ax_big.pie(
+        combined_values,
+        colors=chart_colors,
+        startangle=90,
+        wedgeprops=dict(width=0.42, edgecolor=MPL_BG, linewidth=2),
+    )
+    ax_big.legend(
+        wedges,
+        [f"{lbl} ({val:.1f}%)" for lbl, val in zip(combined_labels, combined_values)],
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.02),
+        ncol=1,
+        frameon=False,
+        fontsize=7.5,
+        labelcolor=MPL_NEUTRAL_600,
+        handlelength=1.2,
+        handletextpad=0.6,
+    )
+    ax_big.set_title(title, fontsize=10, color=MPL_TEXT, pad=6, **_mpl_font("bold"))
+
+    for i, ds in enumerate(per_dataset):
+        ax_mini = fig.add_subplot(gs[1, i])
+        ax_mini.pie(
+            ds["values"],
+            colors=chart_colors,
+            startangle=90,
+            wedgeprops=dict(width=0.42, edgecolor=MPL_BG, linewidth=1.5),
+        )
+        ax_mini.set_title(ds["name"], fontsize=7.5, color=MPL_NEUTRAL_600, pad=3, **_mpl_font("regular"))
+
+    fig.patch.set_alpha(0)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", transparent=True)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _render_bar_chart(
+    axis_sizes: dict[str, int], axis_sizes_breakdown: dict[str, list[dict]] | None = None
+) -> io.BytesIO:
+    """
+    axis_sizes_breakdown, if given: label -> list of {"value": int,
+    "color": hex, "name": str} (one entry per dataset, in the same order
+    for every label) — each bar becomes a horizontal STACKED segment (one
+    color per dataset) instead of a single solid-color bar, with a small
+    legend for which color is which dataset. None (the default) renders
+    exactly as before — single solid-color bars, no legend.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
 
     items = sorted(axis_sizes.items(), key=lambda kv: kv[1])
     labels = [k for k, _ in items]
@@ -438,17 +559,35 @@ def _render_bar_chart(axis_sizes: dict[str, int]) -> io.BytesIO:
 
     height = max(1.6, 0.20 * len(items) + 0.45)
     fig, ax = plt.subplots(figsize=(6.8, height), dpi=200)
-    bars = ax.barh(labels, values, color=MPL_ACCENT, height=0.62)
+
+    legend_handles = None
+    if axis_sizes_breakdown:
+        n_datasets = max((len(axis_sizes_breakdown.get(lbl, [])) for lbl in labels), default=0)
+        left = [0.0] * len(labels)
+        dataset_names_seen: list[tuple[str, str]] = []  # (name, color), for the legend
+        for ds_idx in range(n_datasets):
+            seg_values, seg_color, seg_name = [], MPL_ACCENT, None
+            for lbl in labels:
+                parts = axis_sizes_breakdown.get(lbl, [])
+                if ds_idx < len(parts):
+                    seg_values.append(parts[ds_idx]["value"])
+                    seg_color = parts[ds_idx]["color"]
+                    seg_name = parts[ds_idx]["name"]
+                else:
+                    seg_values.append(0)
+            ax.barh(labels, seg_values, left=left, color=seg_color, height=0.62)
+            left = [l + v for l, v in zip(left, seg_values)]
+            if seg_name is not None:
+                dataset_names_seen.append((seg_name, seg_color))
+        legend_handles = [Patch(facecolor=c, label=n) for n, c in dataset_names_seen]
+    else:
+        ax.barh(labels, values, color=MPL_ACCENT, height=0.62)
+
     max_val = max(values) if values else 1
-    for bar, value in zip(bars, values):
+    for i, value in enumerate(values):
         ax.text(
-            bar.get_width() + max_val * 0.015,
-            bar.get_y() + bar.get_height() / 2,
-            f"{value:,}",
-            va="center",
-            fontsize=7.5,
-            color=MPL_NEUTRAL_600,
-            **_mpl_font("regular"),
+            value + max_val * 0.015, i, f"{value:,}",
+            va="center", fontsize=7.5, color=MPL_NEUTRAL_600, **_mpl_font("regular"),
         )
     ax.set_xlim(0, max_val * 1.12)
     ax.set_xlabel("images", fontsize=8.5, color=MPL_NEUTRAL_600)
@@ -457,6 +596,11 @@ def _render_bar_chart(axis_sizes: dict[str, int]) -> io.BytesIO:
     ax.tick_params(axis="both", labelsize=8, colors=MPL_NEUTRAL_600)
     for spine in ("left", "bottom"):
         ax.spines[spine].set_color(MPL_NEUTRAL_300)
+    if legend_handles:
+        ax.legend(
+            handles=legend_handles, loc="lower right", fontsize=7.5, frameon=False,
+            labelcolor=MPL_NEUTRAL_600,
+        )
     fig.tight_layout()
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", transparent=True)
@@ -541,19 +685,27 @@ def _lerp_hex(a: str, b: str, t: float) -> tuple[float, float, float]:
     return (ar + (br - ar) * t, ag + (bg - ag) * t, ab + (bb - ab) * t)
 
 
-def _render_treemap(axis_sizes: dict[str, int]) -> io.BytesIO:
+def _render_treemap(
+    axis_sizes: dict[str, int], axis_sizes_breakdown: dict[str, list[dict]] | None = None
+) -> io.BytesIO:
     """
     "Cluster imbalance" as a treemap — visually distinct from the plain
-    "Axis sizes" bar chart earlier in the report. Darker/bigger = more
-    images, shaded on the system's own accent ramp (light→dark steel)
-    rather than a generic colormap. Rectangles too small to hold a
-    readable label are left blank rather than overflowing text onto
-    neighboring cells.
+    "Axis sizes" bar chart earlier in the report. Rectangles too small to
+    hold a readable label are left blank rather than overflowing text
+    onto neighboring cells.
+
+    axis_sizes_breakdown, if given: label -> list of {"value": int,
+    "color": hex, "name": str} (one entry per dataset, matching
+    axis_sizes' totals) — each axis's rectangle is split into sub-boxes,
+    one per dataset, colored by dataset (with a small legend) instead of
+    shaded by relative size. None (the default) renders exactly as
+    before — size-shaded rectangles, no split, no legend.
     """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
 
     items = sorted(axis_sizes.items(), key=lambda kv: -kv[1])
     labels = [k for k, _ in items]
@@ -566,13 +718,44 @@ def _render_treemap(axis_sizes: dict[str, int]) -> io.BytesIO:
 
     fig, ax = plt.subplots(figsize=(6.8, 4.1), dpi=200)
     max_val = max(values) if values else 1
+    legend_handles = None
+
     for (rx, ry, rw, rh), label, value in zip(rects, labels, values):
-        norm = value / max_val
-        color = _lerp_hex(MPL_ACCENT_200, MPL_ACCENT_800, 0.15 + 0.85 * norm)
-        ax.add_patch(plt.Rectangle((rx, ry), rw, rh, facecolor=color, edgecolor=MPL_BG, linewidth=2))
-        if rw > 35 and rh > 20:
+        pct = value / total * 100
+        breakdown = axis_sizes_breakdown.get(label) if axis_sizes_breakdown else None
+
+        if breakdown:
+            # Split along whichever dimension is larger, so each
+            # sub-box stays reasonably proportioned regardless of the
+            # parent rectangle's own shape (squarify doesn't guarantee
+            # perfect squares, just near-square).
+            part_total = sum(p["value"] for p in breakdown) or 1
+            if rw >= rh:
+                cx = rx
+                for p in breakdown:
+                    sub_w = rw * (p["value"] / part_total)
+                    ax.add_patch(
+                        plt.Rectangle((cx, ry), sub_w, rh, facecolor=p["color"], edgecolor=MPL_BG, linewidth=2)
+                    )
+                    cx += sub_w
+            else:
+                cy = ry
+                for p in breakdown:
+                    sub_h = rh * (p["value"] / part_total)
+                    ax.add_patch(
+                        plt.Rectangle((rx, cy), rw, sub_h, facecolor=p["color"], edgecolor=MPL_BG, linewidth=2)
+                    )
+                    cy += sub_h
+            if legend_handles is None:
+                legend_handles = [Patch(facecolor=p["color"], label=p["name"]) for p in breakdown]
+            text_color = "white"
+        else:
+            norm = value / max_val
+            color = _lerp_hex(MPL_ACCENT_200, MPL_ACCENT_800, 0.15 + 0.85 * norm)
+            ax.add_patch(plt.Rectangle((rx, ry), rw, rh, facecolor=color, edgecolor=MPL_BG, linewidth=2))
             text_color = "white" if norm > 0.45 else MPL_TEXT
-            pct = value / total * 100
+
+        if rw > 35 and rh > 20:
             if rh > 32:
                 ax.text(
                     rx + rw / 2, ry + rh / 2, label, ha="center", va="bottom",
@@ -598,6 +781,11 @@ def _render_treemap(axis_sizes: dict[str, int]) -> io.BytesIO:
         loc="left",
         **_mpl_font("bold"),
     )
+    if legend_handles:
+        ax.legend(
+            handles=legend_handles, loc="upper center", bbox_to_anchor=(0.5, -0.02), ncol=len(legend_handles),
+            fontsize=8, frameon=False, labelcolor=MPL_NEUTRAL_600,
+        )
     fig.tight_layout()
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", transparent=True)
@@ -611,13 +799,25 @@ def _render_dual_radar(
     dominance_values: dict[str, float],
     normalized_values: dict[str, float],
     dataset_name: str,
+    dominance_values_compare: dict[str, float] | None = None,
+    normalized_values_compare: dict[str, float] | None = None,
+    compare_dataset_name: str | None = None,
 ) -> io.BytesIO:
-    """Two polar radar charts side by side — Dominance % and Normalized
-    similarity, same axes, for direct visual comparison."""
+    """
+    Two polar radar charts side by side — Dominance % and Normalized
+    similarity, same axes, for direct visual comparison. When a second
+    (comparison) dataset's values are provided, both are OVERLAID as
+    separate polygons on each panel — never stacked/summed, since these
+    are percentage-like values where a sum wouldn't mean anything
+    coherent (same reasoning the live app's Stacked mode already applies:
+    it's only offered for additive raw counts).
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
+    multi_dataset = dominance_values_compare is not None and normalized_values_compare is not None
 
     angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
     angles_closed = angles + angles[:1]
@@ -625,37 +825,71 @@ def _render_dual_radar(
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.2), dpi=200, subplot_kw=dict(polar=True))
 
     panels = [
-        (dominance_values, "Dominance (% of images)", lambda v: f"{v * 100:.0f}%"),
-        (normalized_values, "Normalized similarity", lambda v: f"{v:.2f}"),
+        (dominance_values, dominance_values_compare, "Dominance (% of images)", lambda v: f"{v * 100:.0f}%"),
+        (normalized_values, normalized_values_compare, "Normalized similarity", lambda v: f"{v:.2f}"),
     ]
-    for ax, (values_dict, subtitle, fmt) in zip(axes, panels):
-        vals = [values_dict.get(lbl, 0.0) for lbl in labels]
-        vals_closed = vals + vals[:1]
-        ax.plot(angles_closed, vals_closed, color=MPL_ACCENT, linewidth=1.6)
-        ax.fill(angles_closed, vals_closed, color=MPL_ACCENT, alpha=0.3)
-        ax.plot(angles, vals, "o", color=MPL_ACCENT_800, markersize=2.5, zorder=5)
-        for angle, val in zip(angles, vals):
-            ax.annotate(
-                fmt(val),
-                xy=(angle, val),
-                xytext=(0, 6),
-                textcoords="offset points",
-                ha="center",
-                va="bottom",
-                fontsize=6.5,
-                color=MPL_ACCENT_800,
-                **_mpl_font("bold"),
+    for ax, (values_dict, values_dict_compare, subtitle, fmt) in zip(axes, panels):
+        # One series per dataset — (values, display name, fill/line color,
+        # marker/annotation color). Always at least the primary; a second
+        # entry is appended only when comparing.
+        series = [(values_dict, dataset_name, MPL_ACCENT, MPL_ACCENT_800)]
+        if multi_dataset:
+            series.append(
+                (values_dict_compare, compare_dataset_name, MPL_ACCENT_COMPARE, MPL_ACCENT_COMPARE_800)
             )
+
+        all_vals_for_scale: list[float] = []
+        for values_dict_series, series_name, fill_color, marker_color in series:
+            vals = [values_dict_series.get(lbl, 0.0) for lbl in labels]
+            all_vals_for_scale.extend(vals)
+            vals_closed = vals + vals[:1]
+            ax.plot(
+                angles_closed, vals_closed, color=fill_color, linewidth=1.6,
+                label=series_name if multi_dataset else None,
+            )
+            # A lighter fill when overlaying two series — otherwise the
+            # second polygon's fill can fully obscure the first's, and
+            # the overlap itself (the interesting part of a comparison)
+            # becomes unreadable.
+            ax.fill(angles_closed, vals_closed, color=fill_color, alpha=0.3 if not multi_dataset else 0.18)
+            ax.plot(angles, vals, "o", color=marker_color, markersize=2.5, zorder=5)
+            # Per-vertex value annotations only make sense for a single
+            # series — with two overlaid polygons they'd collide and
+            # become unreadable; the legend + polygon shapes carry the
+            # comparison instead.
+            if not multi_dataset:
+                for angle, val in zip(angles, vals):
+                    ax.annotate(
+                        fmt(val),
+                        xy=(angle, val),
+                        xytext=(0, 6),
+                        textcoords="offset points",
+                        ha="center",
+                        va="bottom",
+                        fontsize=6.5,
+                        color=marker_color,
+                        **_mpl_font("bold"),
+                    )
+
         ax.set_xticks(angles)
         ax.set_xticklabels(labels, fontsize=8, color=MPL_NEUTRAL_600)
         ax.set_title(subtitle, fontsize=11, color=MPL_TEXT, pad=18, **_mpl_font("bold"))
         ax.tick_params(axis="y", labelsize=7, colors=MPL_NEUTRAL_600)
         ax.spines["polar"].set_color(MPL_NEUTRAL_300)
         ax.grid(color=MPL_NEUTRAL_300)
-        if vals:
-            ax.set_ylim(0, max(vals) * 1.22)
+        if all_vals_for_scale:
+            ax.set_ylim(0, max(all_vals_for_scale) * 1.22)
+        if multi_dataset:
+            ax.legend(
+                loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=2,
+                fontsize=8, frameon=False, labelcolor=MPL_NEUTRAL_600,
+            )
 
-    fig.suptitle(f"Semantic radar — {dataset_name}", fontsize=12, color=MPL_TEXT, **_mpl_font("bold"))
+    if multi_dataset:
+        title_names = f"{dataset_name} vs {compare_dataset_name}"
+    else:
+        title_names = dataset_name
+    fig.suptitle(f"Semantic radar — {title_names}", fontsize=12, color=MPL_TEXT, **_mpl_font("bold"))
     fig.tight_layout()
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", transparent=True)
@@ -665,40 +899,120 @@ def _render_dual_radar(
 
 
 def _render_umap_scatter(
-    coords: np.ndarray, point_labels: list[str], dataset_name: str
+    coords: np.ndarray,
+    point_labels: list[str],
+    dataset_name: str,
+    dataset_origin: list[str] | None = None,
+    dataset_display_names: dict[str, str] | None = None,
 ) -> io.BytesIO:
-    """Scatter of the 2D projection, colored by dominant axis, with a
-    legend — position/orientation means nothing on its own, only which
-    points cluster together does. Colors are an on-brand steel-blue family
-    (see `_categorical_palette`) rather than a generic rainbow palette."""
+    """
+    Scatter of the 2D projection, colored by dominant axis (on-brand
+    steel-blue family, see `_categorical_palette`), and — when comparing
+    two datasets — shaped by which dataset each point came from. Two
+    separate legends: axis color (right of the plot) and dataset shape
+    (below the plot, only shown when there's more than one dataset).
+    Mirrors the same color=axis / shape=dataset treatment as the live
+    Scatter view in the app (src/viz/scatter.py).
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    if dataset_origin is None:
+        dataset_origin = ["primary"] * len(point_labels)
+    dataset_display_names = dataset_display_names or {}
 
     unique_labels = sorted(set(point_labels))
     palette = _categorical_palette(len(unique_labels))
     color_map = dict(zip(unique_labels, palette))
 
+    # Preserve first-appearance order so "primary" reliably gets the
+    # first marker (circle) rather than depending on string sort.
+    unique_origins: list[str] = []
+    for origin in dataset_origin:
+        if origin not in unique_origins:
+            unique_origins.append(origin)
+    # Mirrors DATASET_SYMBOLS in src/viz/scatter.py (circle, x, diamond,
+    # triangle-up, square, star) using matplotlib's own marker codes.
+    marker_shapes = ["o", "x", "D", "^", "s", "*"]
+    origin_markers = {
+        origin: marker_shapes[i % len(marker_shapes)] for i, origin in enumerate(unique_origins)
+    }
+    multi_dataset = len(unique_origins) > 1
+
     fig, ax = plt.subplots(figsize=(9.8, 5.3), dpi=200)
-    for lbl in unique_labels:
-        idx = [i for i, l in enumerate(point_labels) if l == lbl]
-        ax.scatter(
-            coords[idx, 0], coords[idx, 1], s=7, alpha=0.8,
-            color=color_map[lbl], label=lbl, linewidths=0,
-        )
+    for origin in unique_origins:
+        marker = origin_markers[origin]
+        for lbl in unique_labels:
+            idx = [
+                i for i in range(len(point_labels))
+                if point_labels[i] == lbl and dataset_origin[i] == origin
+            ]
+            if not idx:
+                continue
+            ax.scatter(
+                coords[idx, 0], coords[idx, 1],
+                s=16 if marker != "o" else 7,
+                alpha=0.8,
+                color=color_map[lbl],
+                marker=marker,
+                linewidths=0.8 if marker in ("x", "+") else 0,
+            )
     ax.set_xticks([])
     ax.set_yticks([])
     for spine in ax.spines.values():
         spine.set_visible(False)
-    ax.set_title(f"UMAP — {dataset_name}", fontsize=11, color=MPL_TEXT, loc="left", **_mpl_font("bold"))
-    ax.legend(
-        loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=8, frameon=False,
-        title="Axis", title_fontsize=9, markerscale=1.6, labelcolor=MPL_NEUTRAL_600,
+    if multi_dataset:
+        names_for_title = " vs ".join(dataset_display_names.get(o, o) for o in unique_origins)
+    else:
+        names_for_title = dataset_name
+    ax.set_title(f"UMAP — {names_for_title}", fontsize=11, color=MPL_TEXT, loc="left", **_mpl_font("bold"))
+
+    # Axis legend: color squares, independent of whatever marker shape
+    # the actual points use — built from explicit proxy handles (not the
+    # scatter collections themselves) so it always shows squares.
+    axis_handles = [
+        Line2D([0], [0], marker="s", linestyle="", color=color_map[lbl], markersize=8)
+        for lbl in unique_labels
+    ]
+    axis_legend = ax.legend(
+        axis_handles, unique_labels,
+        loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8, frameon=False,
+        title="Axis", title_fontsize=9, labelcolor=MPL_NEUTRAL_600,
     )
+    # matplotlib only keeps the MOST RECENT legend on an axes by default —
+    # add_artist() is what lets a second, independent legend coexist.
+    ax.add_artist(axis_legend)
+
+    # Dataset legend: neutral-colored shapes, placed below the plot (not
+    # stacked under the axis legend) so its position never depends on how
+    # tall the axis legend happens to be. Only shown when comparing.
+    dataset_legend = None
+    if multi_dataset:
+        dataset_handles = [
+            Line2D([0], [0], marker=origin_markers[o], linestyle="", color=MPL_NEUTRAL_600, markersize=8)
+            for o in unique_origins
+        ]
+        dataset_labels = [dataset_display_names.get(o, o) for o in unique_origins]
+        dataset_legend = ax.legend(
+            dataset_handles, dataset_labels,
+            loc="upper center", bbox_to_anchor=(0.5, -0.05), ncol=len(unique_origins),
+            fontsize=8, frameon=False, title="Dataset", title_fontsize=9, labelcolor=MPL_NEUTRAL_600,
+        )
+
     fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", transparent=True)
+    # bbox_extra_artists tells the tight-bbox calculation to explicitly
+    # account for these two legends — without it, bbox_inches="tight" can
+    # fail to detect a legend added via add_artist() and crop it out of
+    # the saved image entirely (this is what was happening to the Axis
+    # legend specifically).
+    extra_artists = [axis_legend] + ([dataset_legend] if dataset_legend is not None else [])
+    fig.savefig(
+        buf, format="png", bbox_inches="tight", bbox_extra_artists=extra_artists, transparent=True
+    )
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -771,11 +1085,16 @@ def generate_pdf_report(
     duplicate_samples: list[Path] | None = None,
     radar_dominance_values: dict[str, float] | None = None,
     radar_normalized_values: dict[str, float] | None = None,
+    radar_dominance_values_compare: dict[str, float] | None = None,
+    radar_normalized_values_compare: dict[str, float] | None = None,
     umap_coords: np.ndarray | None = None,
     umap_labels: list[str] | None = None,
+    umap_dataset_origin: list[str] | None = None,
+    umap_dataset_display_names: dict[str, str] | None = None,
     clip_mmd: float | None = None,
     clip_mmd_baseline: float | None = None,
     compare_dataset_name: str | None = None,
+    overview_compare: DatasetOverviewMetrics | None = None,
 ) -> bytes:
     """
     Build the full Dataset Report PDF and return its bytes (ready for a
@@ -888,18 +1207,126 @@ def generate_pdf_report(
     # --- KPI cards ------------------------------------------------------
     story.append(_section_header("Overview", styles, portrait_w))
     story.append(Spacer(1, SP_4))
-    cards = [
-        _metric_card(f"{overview.total_images:,}", "Total images", styles),
-        _metric_card(f"{overview.semantic_coverage_pct:.0f}%", "Semantic coverage", styles),
-        _metric_card(f"{overview.unclassified_pct:.1f}%", "Low semantic fit", styles),
-        _metric_card(f"{overview.visual_duplicates_pct:.1f}%", "Visual redundancy", styles),
-        _metric_card(str(overview.n_semantic_axes), "Semantic axes", styles),
-        _metric_card(
-            f"{overview.largest_cluster_pct:.0f}% / {overview.smallest_cluster_pct:.0f}%",
-            "Largest / smallest cluster",
-            styles,
-        ),
-    ]
+
+    comparing = overview_compare is not None
+
+    # Computed once here (not inline at each chart) so the bar chart AND
+    # the treemap both use the exact same combined totals/breakdown —
+    # and so it's safe to reference at the treemap's call site even in
+    # the edge case where the bar chart's own "if axis_sizes:" guard
+    # further down might not fire.
+    combined_axis_sizes: dict[str, int] = overview.axis_sizes
+    axis_sizes_breakdown: dict[str, list[dict]] | None = None
+    # Combined totals/percentages — computed from underlying COUNTS, not
+    # by averaging the two datasets' own percentages (averaging would
+    # misrepresent the combined figure whenever the two datasets are
+    # different sizes: a 1000-image dataset at 90% and a 10-image dataset
+    # at 10% is NOT meaningfully "50% combined" — it's ~89%, dominated by
+    # the much larger dataset). Defaults to the single dataset's own
+    # values when there's no comparison feed, so every one of these is
+    # always safe to reference below regardless of `comparing`.
+    combined_total = overview.total_images
+    combined_unclassified_pct = overview.unclassified_pct
+    combined_semantic_coverage_pct = overview.semantic_coverage_pct
+    combined_duplicates_pct = overview.visual_duplicates_pct
+    if comparing:
+        all_axis_labels = set(overview.axis_sizes) | set(overview_compare.axis_sizes)
+        combined_axis_sizes = {
+            lbl: overview.axis_sizes.get(lbl, 0) + overview_compare.axis_sizes.get(lbl, 0)
+            for lbl in all_axis_labels
+        }
+        axis_sizes_breakdown = {
+            lbl: [
+                {"value": overview.axis_sizes.get(lbl, 0), "color": MPL_ACCENT, "name": dataset_name},
+                {
+                    "value": overview_compare.axis_sizes.get(lbl, 0),
+                    "color": MPL_ACCENT_COMPARE,
+                    "name": compare_dataset_name,
+                },
+            ]
+            for lbl in all_axis_labels
+        }
+        combined_total = overview.total_images + overview_compare.total_images
+        combined_unclassified_pct = (
+            (overview.unclassified_count + overview_compare.unclassified_count) / combined_total * 100
+            if combined_total
+            else 0.0
+        )
+        combined_semantic_coverage_pct = 100.0 - combined_unclassified_pct
+        combined_duplicates_pct = (
+            (overview.visual_duplicates_count + overview_compare.visual_duplicates_count)
+            / combined_total
+            * 100
+            if combined_total
+            else 0.0
+        )
+    if comparing:
+        primary_swatch = {"color": MPL_ACCENT, "name": dataset_name}
+        compare_swatch = {"color": MPL_ACCENT_COMPARE, "name": compare_dataset_name}
+
+        def _bd(primary_value: str, compare_value: str) -> list[dict]:
+            return [
+                {**primary_swatch, "value": primary_value},
+                {**compare_swatch, "value": compare_value},
+            ]
+
+        cards = [
+            _metric_card(
+                f"{combined_total:,}",
+                "Total images",
+                styles,
+                breakdown=_bd(f"{overview.total_images:,}", f"{overview_compare.total_images:,}"),
+            ),
+            _metric_card(
+                f"{combined_semantic_coverage_pct:.0f}%",
+                "Semantic coverage",
+                styles,
+                breakdown=_bd(
+                    f"{overview.semantic_coverage_pct:.0f}%", f"{overview_compare.semantic_coverage_pct:.0f}%"
+                ),
+            ),
+            _metric_card(
+                f"{combined_unclassified_pct:.1f}%",
+                "Low semantic fit",
+                styles,
+                breakdown=_bd(
+                    f"{overview.unclassified_pct:.1f}%", f"{overview_compare.unclassified_pct:.1f}%"
+                ),
+            ),
+            _metric_card(
+                f"{combined_duplicates_pct:.1f}%",
+                "Visual redundancy",
+                styles,
+                breakdown=_bd(
+                    f"{overview.visual_duplicates_pct:.1f}%", f"{overview_compare.visual_duplicates_pct:.1f}%"
+                ),
+            ),
+            # Semantic axes: both datasets are scored against the exact
+            # SAME axis set, so a per-dataset breakdown would just show
+            # two identical numbers — no breakdown here on purpose.
+            _metric_card(str(overview.n_semantic_axes), "Semantic axes", styles),
+            # Largest/smallest cluster stays as a single combined card —
+            # already fairly dense at 2 numbers; a 4-number breakdown
+            # here would be hard to read at this card size.
+            _metric_card(
+                f"{overview.largest_cluster_pct:.0f}% / {overview.smallest_cluster_pct:.0f}%",
+                "Largest / smallest cluster",
+                styles,
+            ),
+        ]
+    else:
+        cards = [
+            _metric_card(f"{overview.total_images:,}", "Total images", styles),
+            _metric_card(f"{overview.semantic_coverage_pct:.0f}%", "Semantic coverage", styles),
+            _metric_card(f"{overview.unclassified_pct:.1f}%", "Low semantic fit", styles),
+            _metric_card(f"{overview.visual_duplicates_pct:.1f}%", "Visual redundancy", styles),
+            _metric_card(str(overview.n_semantic_axes), "Semantic axes", styles),
+            _metric_card(
+                f"{overview.largest_cluster_pct:.0f}% / {overview.smallest_cluster_pct:.0f}%",
+                "Largest / smallest cluster",
+                styles,
+            ),
+        ]
     n_cols = 3
     rows = [cards[i : i + n_cols] for i in range(0, len(cards), n_cols)]
     kpi_table = Table(rows, colWidths=[portrait_w / n_cols] * n_cols, hAlign="LEFT")
@@ -918,19 +1345,60 @@ def generate_pdf_report(
     story.append(Spacer(1, SP_4))
 
     # --- Donut charts -----------------------------------------------
-    coverage_buf = _render_donut(
-        ["Classified", "Unclassified"],
-        [overview.semantic_coverage_pct, overview.unclassified_pct],
-        [MPL_ACCENT, MPL_NEUTRAL_300],
-        "Semantic coverage",
-    )
-    duplicates_buf = _render_donut(
-        ["Unique", "Near-duplicate"],
-        [100 - overview.visual_duplicates_pct, overview.visual_duplicates_pct],
-        [MPL_ACCENT, MPL_NEUTRAL_300],
-        "Visual redundancy",
-    )
-    chart_w = portrait_w * 0.30
+    if comparing:
+        coverage_buf = _render_donut_with_breakdown(
+            "Semantic coverage",
+            ["Classified", "Unclassified"],
+            [combined_semantic_coverage_pct, combined_unclassified_pct],
+            [MPL_ACCENT, MPL_NEUTRAL_300],
+            [
+                {
+                    "name": dataset_name,
+                    "values": [overview.semantic_coverage_pct, overview.unclassified_pct],
+                },
+                {
+                    "name": compare_dataset_name,
+                    "values": [overview_compare.semantic_coverage_pct, overview_compare.unclassified_pct],
+                },
+            ],
+        )
+        duplicates_buf = _render_donut_with_breakdown(
+            "Visual redundancy",
+            ["Unique", "Near-duplicate"],
+            [100 - combined_duplicates_pct, combined_duplicates_pct],
+            [MPL_ACCENT, MPL_NEUTRAL_300],
+            [
+                {
+                    "name": dataset_name,
+                    "values": [100 - overview.visual_duplicates_pct, overview.visual_duplicates_pct],
+                },
+                {
+                    "name": compare_dataset_name,
+                    "values": [
+                        100 - overview_compare.visual_duplicates_pct,
+                        overview_compare.visual_duplicates_pct,
+                    ],
+                },
+            ],
+        )
+        # A bit wider than the single-dataset case — the composite image
+        # now stacks 3 pie charts (1 big + 2 mini), so the same width
+        # would make the mini donuts uncomfortably small.
+        chart_w = portrait_w * 0.34
+    else:
+        coverage_buf = _render_donut(
+            ["Classified", "Unclassified"],
+            [overview.semantic_coverage_pct, overview.unclassified_pct],
+            [MPL_ACCENT, MPL_NEUTRAL_300],
+            "Semantic coverage",
+        )
+        duplicates_buf = _render_donut(
+            ["Unique", "Near-duplicate"],
+            [100 - overview.visual_duplicates_pct, overview.visual_duplicates_pct],
+            [MPL_ACCENT, MPL_NEUTRAL_300],
+            "Visual redundancy",
+        )
+        chart_w = portrait_w * 0.30
     donut_table = Table(
         [
             [
@@ -944,8 +1412,11 @@ def generate_pdf_report(
     story.append(donut_table)
 
     # --- Axis size bar chart -----------------------------------------
-    if overview.axis_sizes:
-        bar_buf = _render_bar_chart(overview.axis_sizes)
+    if overview.axis_sizes or (overview_compare and overview_compare.axis_sizes):
+        if comparing:
+            bar_buf = _render_bar_chart(combined_axis_sizes, axis_sizes_breakdown)
+        else:
+            bar_buf = _render_bar_chart(overview.axis_sizes)
         story.append(Spacer(1, SP_2))
         story.append(_Blueprint(_rl_image_for_width(bar_buf, portrait_w - 26), pad=6, margin=7))
 
@@ -1049,7 +1520,7 @@ def generate_pdf_report(
     # Treemap — deliberately a different chart TYPE from "Axis sizes"
     # earlier in the report, so the two don't look like duplicates.
     if overview.axis_sizes:
-        treemap_buf = _render_treemap(overview.axis_sizes)
+        treemap_buf = _render_treemap(combined_axis_sizes, axis_sizes_breakdown if comparing else None)
         story.append(_Blueprint(_rl_image_for_width(treemap_buf, portrait_w - 26), pad=6, margin=7))
 
     # --- Landscape: dual radar comparison -----------------------------
@@ -1058,7 +1529,13 @@ def generate_pdf_report(
         story.append(PageBreak())
         radar_labels = sorted(set(radar_dominance_values) | set(radar_normalized_values))
         radar_buf = _render_dual_radar(
-            radar_labels, radar_dominance_values, radar_normalized_values, dataset_name
+            radar_labels,
+            radar_dominance_values,
+            radar_normalized_values,
+            dataset_name,
+            radar_dominance_values_compare,
+            radar_normalized_values_compare,
+            compare_dataset_name,
         )
         radar_frame = _Blueprint(_rl_image_for_width(radar_buf, landscape_w - 26), pad=6, margin=7)
         radar_frame.wrap(landscape_w, landscape_h)
@@ -1069,7 +1546,9 @@ def generate_pdf_report(
     if umap_coords is not None and umap_labels:
         story.append(NextPageTemplate("Landscape"))
         story.append(PageBreak())
-        umap_buf = _render_umap_scatter(umap_coords, umap_labels, dataset_name)
+        umap_buf = _render_umap_scatter(
+            umap_coords, umap_labels, dataset_name, umap_dataset_origin, umap_dataset_display_names
+        )
         umap_frame = _Blueprint(_rl_image_for_width(umap_buf, landscape_w - 26), pad=6, margin=7)
         umap_frame.wrap(landscape_w, landscape_h)
         story.append(Spacer(1, max(0, (landscape_h - umap_frame.height) / 2)))

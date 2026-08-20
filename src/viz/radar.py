@@ -10,6 +10,24 @@ from __future__ import annotations
 
 import plotly.graph_objects as go
 
+# The same primary/comparison color pair used everywhere else a second
+# dataset is shown (PDF radar and scatter — see MPL_ACCENT/
+# MPL_ACCENT_COMPARE in src/report/pdf_report.py). Duplicated here rather
+# than imported — this module is Plotly-based and shouldn't depend on the
+# PDF module's matplotlib setup — but MUST be kept in sync with those two
+# hex values if either ever changes, or the live app and the PDF will
+# show different colors for the same comparison.
+DATASET_COLORS = ["#5980A6", "#D97B29"]
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    """hex color -> 'rgba(r, g, b, alpha)' string, for a fill that needs
+    its own transparency independent of the line/marker opacity (Plotly's
+    trace-level `opacity` would otherwise dim those too)."""
+    hex_color = hex_color.lstrip("#")
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    return f"rgba({r}, {g}, {b}, {alpha})"
+
 
 def build_radar_figure(
     datasets: dict[str, dict[str, float]],
@@ -53,7 +71,7 @@ def build_radar_figure(
     fig = go.Figure()
 
     all_raw_values: list[float] = []
-    for series_name, values in datasets.items():
+    for i, (series_name, values) in enumerate(datasets.items()):
         r = [values.get(label, 0.0) for label in all_labels]
         all_raw_values.extend(r)
 
@@ -79,13 +97,22 @@ def build_radar_figure(
                 "<extra>" + series_name + "</extra>"
             )
 
+        color = DATASET_COLORS[i % len(DATASET_COLORS)]
+        multi = len(datasets) > 1
         fig.add_trace(
             go.Scatterpolar(
                 r=r_closed,
                 theta=theta_closed,
                 fill="toself",
                 mode="lines+markers",
-                marker=dict(size=8),
+                marker=dict(size=8, color=color),
+                line=dict(color=color),
+                # A lighter fill when overlaying two series — otherwise
+                # the second polygon's fill can fully obscure the first's,
+                # and the overlap itself (the interesting part of a
+                # comparison) becomes unreadable. Same reasoning as the
+                # PDF's matplotlib version of this same chart.
+                fillcolor=_hex_to_rgba(color, 0.3 if multi else 0.45),
                 name=series_name,
                 customdata=customdata_closed,
                 hovertemplate=hovertemplate,
@@ -141,13 +168,15 @@ def build_stacked_radar_figure(
                 all_labels.append(label)
 
     fig = go.Figure()
-    for series_name, values in datasets.items():
+    for i, (series_name, values) in enumerate(datasets.items()):
         r = [values.get(label, 0.0) for label in all_labels]
+        color = DATASET_COLORS[i % len(DATASET_COLORS)]
         fig.add_trace(
             go.Barpolar(
                 r=r,
                 theta=all_labels,
                 name=series_name,
+                marker=dict(color=color),
                 hovertemplate=(
                     "<b>%{theta}</b><br>"
                     f"{value_label}: %{{r:{value_format}}}"
