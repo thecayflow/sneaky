@@ -696,7 +696,7 @@ if result is not None:
                     result["paths"],
                     other_threshold,
                 )
-                st.success(message)
+                st.toast(message, icon="✅")
         if is_removable_auto_axis:
             if c4.button("Remove", key=f"remove_auto_{label}"):
                 st.session_state.excluded_axis_labels.add(label)
