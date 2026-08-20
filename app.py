@@ -410,7 +410,7 @@ def show_axis_images_dialog(label: str, embeddings, axes, paths, other_threshold
 
 path = st.text_input(
     "Dataset folder path",
-    placeholder=r"E:\dataset_unificado",
+    placeholder=r"C:\Projects\sneaky\dataset_samples\sample_01",
     help="Any local folder — subfolders are searched too. Nothing is copied.",
 )
 
@@ -423,7 +423,7 @@ with st.expander("Compare with a second feed (optional)"):
     compare_path = st.text_input(
         "Second feed folder path",
         key="compare_path_input",
-        placeholder=r"E:\another_dataset",
+        placeholder=r"C:\Projects\sneaky\dataset_samples\sample_02",
     )
     if st.button("Load comparison feed"):
         if not compare_path:
@@ -705,7 +705,7 @@ if result is not None:
     st.text_input(
         "Copy destination folder",
         key="copy_destination_input",
-        placeholder=r"E:\dataset_samples\sample_01",
+        placeholder=r"C:\Projects\sneaky\dataset_samples\dataset_copy",
         help="Used by every 'Copy images to...' button above — set it "
         "once, then click 'Copy images to...' on as many axes as you "
         "like; they all land in this same folder (created automatically "
