@@ -19,7 +19,6 @@ import base64
 import io
 import random
 import sys
-import tempfile
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -336,67 +335,11 @@ def show_axis_images_dialog(label: str, embeddings, axes, paths, other_threshold
         st.caption("— end of results —")
 
 
-source_mode = st.radio(
-    "Dataset source",
-    options=["Local folder path", "Upload images"],
-    horizontal=True,
-    help=(
-        "'Local folder path' works when running the app on your own "
-        "machine — nothing is copied, just point at a folder. 'Upload "
-        "images' is for the Streamlit Cloud version, which can't see "
-        "your computer's files directly — pick a folder of images to "
-        "upload instead."
-    ),
+path = st.text_input(
+    "Dataset folder path",
+    placeholder=r"E:\dataset_unificado",
+    help="Any local folder — subfolders are searched too. Nothing is copied.",
 )
-
-if source_mode == "Local folder path":
-    path = st.text_input(
-        "Dataset folder path",
-        placeholder=r"E:\dataset_unificado",
-        help="Any local folder — subfolders are searched too. Nothing is copied.",
-    )
-else:
-    uploaded_files = st.file_uploader(
-        "Upload a folder of images",
-        type=["jpg", "jpeg", "png", "bmp", "webp", "tiff", "heic", "heif"],
-        accept_multiple_files="directory",
-        help="Pick a folder — every image inside it (including subfolders) "
-        "gets uploaded. Uploaded images are saved to a temporary folder on "
-        "the server for this session only, then analyzed exactly like a "
-        "local folder would be.",
-    )
-    path = None
-    if uploaded_files:
-        # Streamlit reruns this whole script on almost every widget
-        # interaction elsewhere on the page — only re-write the uploaded
-        # files to disk when the actual set of files changes, or this
-        # would re-save potentially thousands of files on every rerun.
-        fingerprint = tuple((f.name, f.size) for f in uploaded_files)
-        if st.session_state.get("uploaded_fingerprint") != fingerprint:
-            with st.spinner(f"Saving {len(uploaded_files)} uploaded images..."):
-                upload_dir = tempfile.mkdtemp(prefix="sneaky_upload_")
-                seen_names: set[str] = set()
-                for f in uploaded_files:
-                    # Directory uploads can include the same filename from
-                    # different subfolders (e.g. two "IMG_0001.jpg" in
-                    # separate subfolders) — everything lands flattened in
-                    # one folder here, so de-duplicate names to avoid one
-                    # upload silently overwriting another.
-                    target_name = Path(f.name).name  # drop any subfolder prefix
-                    candidate = target_name
-                    counter = 1
-                    while candidate in seen_names:
-                        stem = Path(target_name).stem
-                        suffix = Path(target_name).suffix
-                        candidate = f"{stem}_{counter}{suffix}"
-                        counter += 1
-                    seen_names.add(candidate)
-                    with open(Path(upload_dir) / candidate, "wb") as out:
-                        out.write(f.getbuffer())
-            st.session_state.uploaded_fingerprint = fingerprint
-            st.session_state.uploaded_dir = upload_dir
-        path = st.session_state.uploaded_dir
-        st.success(f"{len(uploaded_files)} images ready to analyze.")
 
 with st.expander("Compare with a second feed"):
     st.caption(
@@ -473,10 +416,7 @@ if linkage_choice != st.session_state.linkage_method:
 
 if st.button("Analyze", type="primary"):
     if not path:
-        if source_mode == "Upload images":
-            st.error("Please upload a folder of images first.")
-        else:
-            st.error("Please enter a folder path.")
+        st.error("Please enter a folder path.")
     elif not Path(path).exists() or not Path(path).is_dir():
         st.error(f"'{path}' is not a valid folder.")
     else:
