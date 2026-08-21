@@ -369,7 +369,11 @@ def _section_header(text: str, styles: dict, width: float) -> Table:
 
 
 def _metric_card(
-    value: str, label: str, styles: dict, breakdown: list[dict] | None = None
+    value: str,
+    label: str,
+    styles: dict,
+    breakdown: list[dict] | None = None,
+    card_width: float = 1.5 * inch,
 ) -> _Blueprint:
     """
     One KPI 'card' — big number, small label underneath, framed as a
@@ -383,9 +387,16 @@ def _metric_card(
     default) renders exactly as before — a single big value and label,
     no breakdown row — so every existing single-dataset call site is
     completely unaffected.
+
+    card_width: the card's own INNER content width (before pad/margin are
+    added) — defaults to the original fixed 1.5 inch, but the KPI row
+    passes an explicitly computed width so the row of cards' own outer
+    edges land exactly on portrait_w (matching Axis sizes/the callout/
+    the donuts), instead of leaving a gap on the right where these
+    fixed-width cards used to fall short of a wider shared cell.
     """
     n_cols = len(breakdown) if breakdown else 1
-    col_width = (1.5 * inch) / n_cols
+    col_width = card_width / n_cols
 
     rows = [
         [Paragraph(value, styles["card_value"])] + [""] * (n_cols - 1),
@@ -826,7 +837,7 @@ def _render_treemap(
     ax.invert_yaxis()
     ax.axis("off")
     ax.set_title(
-        "How diverse is it? — Cluster imbalance",
+        "Cluster imbalance",
         fontsize=10,
         color=MPL_TEXT,
         loc="left",
@@ -1083,6 +1094,38 @@ def _thumbnail_bytes(path: Path, max_size: int = 400) -> io.BytesIO | None:
         return None
 
 
+def _thumb_with_caption(image_flowable, caption_flowable, col_width: float):
+    """
+    Combines one thumbnail and its caption into a single small block —
+    used instead of building one shared "row of images" + "row of
+    captions" across a whole row of thumbnails, because reportlab sizes
+    each of THOSE rows to its tallest member: with images of different
+    real aspect ratios (never distorted to a uniform size — a firm rule
+    for this report), the shorter thumbnails would end up with a big,
+    uneven gap before their caption, while the tallest one has none.
+    Bundling image+caption into one block per thumbnail keeps that gap
+    FIXED for every thumbnail — any leftover height instead lands at the
+    bottom of the shorter columns, where it doesn't disturb the caption's
+    position relative to its own image.
+    """
+    inner = Table([[image_flowable], [caption_flowable]], colWidths=[col_width])
+    inner.setStyle(
+        TableStyle(
+            [
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("TOPPADDING", (0, 0), (-1, 0), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
+                ("TOPPADDING", (0, 1), (-1, 1), 4),
+                ("BOTTOMPADDING", (0, 1), (-1, 1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
+    return inner
+
+
 def _sample_thumbnail_row(
     doc_width: float,
     paths: list[Path],
@@ -1090,6 +1133,7 @@ def _sample_thumbnail_row(
     n_cols: int = 6,
     thumb_size: float = None,
     dataset_names: list[str] | None = None,
+    dedupe_keys: list | None = None,
 ) -> Table | None:
     """
     A single row of small thumbnails with the filename underneath — used
@@ -1111,10 +1155,44 @@ def _sample_thumbnail_row(
     dataset it came from, steel-blue/amber in first-seen order, same
     convention as everywhere else two datasets are distinguished. None
     (the default) keeps the original plain gray filename-only caption.
+
+    dedupe_keys, if given: one entry per path (same order/length), or
+    None for a path that isn't part of any group worth avoiding — when
+    picking which show_count paths to actually display (out of a longer
+    ranked list), skips a candidate if its key has ALREADY been used by
+    an earlier pick, walking further down the ranked list instead, so the
+    shown sample doesn't end up with 2+ images that are actually
+    near-duplicates of each other (e.g. two photos from the same
+    near-duplicate GROUP both showing up in "Low semantic fit" just
+    because they happened to rank next to each other). Falls back to
+    allowing repeats only if there aren't enough distinct-key candidates
+    left to fill show_count. None (the default) just takes the first
+    show_count, unchanged from before.
     """
     thumb_w = (thumb_size or (doc_width / n_cols - 6)) - 14  # leave room for the frame
     total = len(paths)
     show_count = n_cols if total <= n_cols else n_cols - 1
+
+    if dedupe_keys:
+        shown_indices: list[int] = []
+        used_keys = set()
+        for i in range(total):
+            key = dedupe_keys[i]
+            if key is None or key not in used_keys:
+                shown_indices.append(i)
+                if key is not None:
+                    used_keys.add(key)
+            if len(shown_indices) == show_count:
+                break
+        if len(shown_indices) < show_count:
+            # Not enough distinct-key candidates to fill every slot —
+            # fill what's left, in rank order, allowing repeats.
+            shown_set = set(shown_indices)
+            leftover = [i for i in range(total) if i not in shown_set]
+            shown_indices += leftover[: show_count - len(shown_indices)]
+        shown_indices.sort()
+    else:
+        shown_indices = list(range(min(show_count, total)))
 
     dataset_color_map: dict[str, str] = {}
     if dataset_names:
@@ -1126,13 +1204,14 @@ def _sample_thumbnail_row(
         dataset_color_map = {name: palette[i % len(palette)] for i, name in enumerate(seen_names)}
 
     cells = []
-    for idx, p in enumerate(paths[:show_count]):
+    for i in shown_indices:
+        p = paths[i]
         buf = _thumbnail_bytes(p, max_size=300)
         if buf is None:
             continue
         framed = _Blueprint(_rl_image_for_width(buf, thumb_w), pad=3, margin=6)
         if dataset_names:
-            ds_name = dataset_names[idx]
+            ds_name = dataset_names[i]
             color = dataset_color_map.get(ds_name, MPL_NEUTRAL_600)
             caption = Paragraph(f'<font color="{color}">{p.name}<br/>{ds_name}</font>', styles["caption"])
         else:
@@ -1141,7 +1220,7 @@ def _sample_thumbnail_row(
 
     if total > n_cols:
         remaining = total - show_count
-        more_inner = Table([[Paragraph(f'<font size="13"><b>{remaining}</b></font><br/>'
+        more_inner = Table([[Paragraph(f'<font size="13"><b>+{remaining}</b></font><br/>'
                                         f'<font size="8">MORE...</font>', styles["caption"])]],
                             colWidths=[thumb_w], rowHeights=[thumb_w * 0.72])
         more_inner.setStyle(
@@ -1152,26 +1231,56 @@ def _sample_thumbnail_row(
 
     if not cells:
         return None
-    while len(cells) < n_cols:
-        cells.append(["", ""])
+    col_width = doc_width / n_cols
+    blocks = [_thumb_with_caption(framed, caption, col_width) for framed, caption in cells]
+    while len(blocks) < n_cols:
+        blocks.append("")
 
-    table = Table(
-        [[c[0] for c in cells], [c[1] for c in cells]],
-        colWidths=[doc_width / n_cols] * n_cols,
-    )
-    table.setStyle(
-        TableStyle(
-            [
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("TOPPADDING", (0, 0), (-1, 0), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
-                ("TOPPADDING", (0, 1), (-1, 1), 4),
-                ("BOTTOMPADDING", (0, 1), (-1, 1), 4),
-            ]
-        )
-    )
+    table = Table([blocks], colWidths=[col_width] * n_cols)
+    table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
     return table
+
+
+def _select_diverse_subset(
+    group: list[tuple[Path, str]], show_count: int
+) -> list[tuple[Path, str]]:
+    """
+    Picks which `show_count` members of a group to actually display as
+    thumbnails, prioritizing representation from BOTH datasets when a
+    group spans two. Groups are built by concatenating one dataset's
+    matching paths then the other's, so a plain "first N" slice tends to
+    grab only the majority dataset's images — showing a supposed "mix"
+    that turns out to be all one color defeats the point of the
+    blue/amber distinction. Guarantees up to 2 images from the minority
+    dataset are included (or all of them, if it has fewer than 2), filling
+    the remaining slots with the majority dataset's images. Falls back to
+    the group's original order for single-dataset groups (e.g. every
+    "Near duplicates" group, which never spans two datasets by
+    construction) — a no-op there.
+    """
+    if show_count >= len(group):
+        return list(group)
+
+    by_dataset: dict[str, list[tuple[Path, str]]] = {}
+    for item in group:
+        by_dataset.setdefault(item[1], []).append(item)
+
+    if len(by_dataset) < 2:
+        return group[:show_count]
+
+    datasets_by_size = sorted(by_dataset.items(), key=lambda kv: len(kv[1]))
+    minority_items = datasets_by_size[0][1]
+    guaranteed = minority_items[: min(2, len(minority_items), show_count)]
+    guaranteed_set = set(guaranteed)
+
+    remaining_slots = show_count - len(guaranteed)
+    filler = [item for item in group if item not in guaranteed_set][:remaining_slots]
+
+    selected = guaranteed + filler
+    # Restore the group's original relative order for a natural-looking
+    # row, rather than clumping the minority picks at the front.
+    selected.sort(key=lambda item: group.index(item))
+    return selected
 
 
 def _flowing_thumbnail_grid(
@@ -1223,7 +1332,8 @@ def _flowing_thumbnail_grid(
     for gi, group in enumerate(groups):
         total = len(group)
         show_count = n_cols if total <= n_cols else n_cols - 1
-        for idx, (path, ds_name) in enumerate(group[:show_count]):
+        shown_items = _select_diverse_subset(group, show_count)
+        for idx, (path, ds_name) in enumerate(shown_items):
             cells_flat.append(
                 {
                     "type": "image",
@@ -1239,7 +1349,7 @@ def _flowing_thumbnail_grid(
     for cell in cells_flat:
         if cell["type"] == "more":
             more_inner = Table(
-                [[Paragraph(f'<font size="13"><b>{cell["count"]}</b></font><br/>'
+                [[Paragraph(f'<font size="13"><b>+{cell["count"]}</b></font><br/>'
                             f'<font size="8">MORE...</font>', styles["caption"])]],
                 colWidths=[thumb_w], rowHeights=[thumb_w * 0.72],
             )
@@ -1262,27 +1372,15 @@ def _flowing_thumbnail_grid(
     if not rendered_cells:
         return []
 
+    col_width = doc_width / n_cols
     row_flowables = []
     for i in range(0, len(rendered_cells), n_cols):
         row_cells = list(rendered_cells[i : i + n_cols])
-        while len(row_cells) < n_cols:
-            row_cells.append(("", ""))
-        table = Table(
-            [[c[0] for c in row_cells], [c[1] for c in row_cells]],
-            colWidths=[doc_width / n_cols] * n_cols,
-        )
-        table.setStyle(
-            TableStyle(
-                [
-                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("TOPPADDING", (0, 0), (-1, 0), 4),
-                    ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
-                    ("TOPPADDING", (0, 1), (-1, 1), 4),
-                    ("BOTTOMPADDING", (0, 1), (-1, 1), 4),
-                ]
-            )
-        )
+        blocks = [_thumb_with_caption(framed, caption, col_width) for framed, caption in row_cells]
+        while len(blocks) < n_cols:
+            blocks.append("")
+        table = Table([blocks], colWidths=[col_width] * n_cols)
+        table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
         row_flowables.append(table)
     return row_flowables
 
@@ -1293,9 +1391,9 @@ def generate_pdf_report(
     representative_images: list[tuple[str, Path]],
     low_fit_samples: list[Path] | None = None,
     low_fit_dataset_names: list[str] | None = None,
+    low_fit_dupe_keys: list | None = None,
     duplicate_groups: list[list[tuple[Path, str]]] | None = None,
-    cross_dataset_match_count: int | None = None,
-    cross_dataset_groups: list[list[tuple[Path, str]]] | None = None,
+    duplicate_match_count: int | None = None,
     radar_dominance_values: dict[str, float] | None = None,
     radar_normalized_values: dict[str, float] | None = None,
     radar_dominance_values_compare: dict[str, float] | None = None,
@@ -1368,7 +1466,7 @@ def generate_pdf_report(
     story.append(
         Paragraph(
             f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
-            f"{overview.total_images:,} images",
+            f"{overview.total_images + (overview_compare.total_images if overview_compare else 0):,} images",
             styles["subtitle"],
         )
     )
@@ -1393,8 +1491,21 @@ def generate_pdf_report(
     combined_unclassified_count = overview.unclassified_count + (
         overview_compare.unclassified_count if comparing else 0
     )
+    # Still the WITHIN-dataset-only redundancy figure — this is what the
+    # "Visual redundancy" KPI card/donut means (how bloated is each
+    # dataset with its OWN near-duplicates), a per-dataset data-quality
+    # signal that's conceptually different from — and shouldn't change
+    # just because of — the unified duplicate_match_count below.
     combined_duplicate_count = overview.visual_duplicates_count + (
         overview_compare.visual_duplicates_count if comparing else 0
+    )
+    # The broader figure for the callout/section header: ALL near-duplicate
+    # groups shown in the unified thumbnail section below, whether within
+    # one dataset or spanning both (see get_all_duplicate_groups_combined)
+    # — falls back to the narrower within-dataset count if the caller
+    # didn't pass it, so this function still works with older call sites.
+    shown_duplicate_count = (
+        duplicate_match_count if duplicate_match_count is not None else combined_duplicate_count
     )
 
     callout_lines = []
@@ -1404,18 +1515,12 @@ def generate_pdf_report(
             "They don't strongly match any of the detected themes — worth a quick "
             "look to confirm they belong in this dataset."
         )
-    if combined_duplicate_count > 0:
+    if shown_duplicate_count > 0:
         callout_lines.append(
-            f"<b>{combined_duplicate_count:,} images belong to near-duplicate "
-            "groups.</b> This may be expected (e.g. burst-mode photos) or a sign of "
-            "redundancy, depending on what this dataset is for."
-        )
-    if cross_dataset_match_count:
-        callout_lines.append(
-            f"<b>{cross_dataset_match_count:,} images appear in both datasets.</b> "
-            f"Same or near-identical photo present in \u201c{dataset_name}\u201d and "
-            f"\u201c{compare_dataset_name}\u201d \u2014 worth checking whether that's "
-            "expected overlap or accidental duplication between the two."
+            f"<b>{shown_duplicate_count:,} images belong to near-duplicate groups.</b> "
+            "This may be expected (e.g. burst-mode photos, or the same subject "
+            "appearing in both datasets) or a sign of redundancy, depending on what "
+            "this dataset is for."
         )
     if clip_mmd is not None and clip_mmd_baseline is not None and compare_dataset_name:
         callout_lines.append(
@@ -1431,7 +1536,7 @@ def generate_pdf_report(
         callout_inner = Table(
             [[Paragraph("What should I look at?", styles["section"])]]
             + [[Paragraph(line, styles["callout_body"])] for line in callout_lines],
-            colWidths=[portrait_w - 32],
+            colWidths=[portrait_w - 34],
         )
         callout_inner.setStyle(
             TableStyle(
@@ -1512,12 +1617,25 @@ def generate_pdf_report(
                 {**compare_swatch, "value": compare_value},
             ]
 
+        # A small fixed gap between cards (matching the donuts' own gap
+        # convention below), with each card's width computed so 3 cards +
+        # 2 gaps land exactly on portrait_w — the cards' own fixed 1.5in
+        # default width otherwise falls well short of the row's outer
+        # edges, unlike Axis sizes/the callout/the donuts. card_total_w is
+        # each card's full rendered (Blueprint) width, used for the outer
+        # table's column widths below; card_w is the INNER width to pass
+        # into _metric_card, before its own pad/margin add 18pt back.
+        kpi_gap = 16
+        card_total_w = (portrait_w - 2 * kpi_gap) / 3
+        card_w = card_total_w - 18
+
         cards = [
             _metric_card(
                 f"{combined_total:,}",
                 "Total images",
                 styles,
                 breakdown=_bd(f"{overview.total_images:,}", f"{overview_compare.total_images:,}"),
+                card_width=card_w,
             ),
             _metric_card(
                 f"{combined_semantic_coverage_pct:.0f}%",
@@ -1526,6 +1644,7 @@ def generate_pdf_report(
                 breakdown=_bd(
                     f"{overview.semantic_coverage_pct:.0f}%", f"{overview_compare.semantic_coverage_pct:.0f}%"
                 ),
+                card_width=card_w,
             ),
             _metric_card(
                 f"{combined_unclassified_pct:.1f}%",
@@ -1534,6 +1653,7 @@ def generate_pdf_report(
                 breakdown=_bd(
                     f"{overview.unclassified_pct:.1f}%", f"{overview_compare.unclassified_pct:.1f}%"
                 ),
+                card_width=card_w,
             ),
             _metric_card(
                 f"{combined_duplicates_pct:.1f}%",
@@ -1542,11 +1662,12 @@ def generate_pdf_report(
                 breakdown=_bd(
                     f"{overview.visual_duplicates_pct:.1f}%", f"{overview_compare.visual_duplicates_pct:.1f}%"
                 ),
+                card_width=card_w,
             ),
             # Semantic axes: both datasets are scored against the exact
             # SAME axis set, so a per-dataset breakdown would just show
             # two identical numbers — no breakdown here on purpose.
-            _metric_card(str(overview.n_semantic_axes), "Semantic axes", styles),
+            _metric_card(str(overview.n_semantic_axes), "Semantic axes", styles, card_width=card_w),
             # Largest/smallest cluster stays as a single combined card —
             # already fairly dense at 2 numbers; a 4-number breakdown
             # here would be hard to read at this card size.
@@ -1554,32 +1675,58 @@ def generate_pdf_report(
                 f"{overview.largest_cluster_pct:.0f}% / {overview.smallest_cluster_pct:.0f}%",
                 "Largest / smallest cluster",
                 styles,
+                card_width=card_w,
             ),
         ]
     else:
+        kpi_gap = 16
+        card_total_w = (portrait_w - 2 * kpi_gap) / 3
+        card_w = card_total_w - 18
         cards = [
-            _metric_card(f"{overview.total_images:,}", "Total images", styles),
-            _metric_card(f"{overview.semantic_coverage_pct:.0f}%", "Semantic coverage", styles),
-            _metric_card(f"{overview.unclassified_pct:.1f}%", "Low semantic fit", styles),
-            _metric_card(f"{overview.visual_duplicates_pct:.1f}%", "Visual redundancy", styles),
-            _metric_card(str(overview.n_semantic_axes), "Semantic axes", styles),
+            _metric_card(f"{overview.total_images:,}", "Total images", styles, card_width=card_w),
+            _metric_card(
+                f"{overview.semantic_coverage_pct:.0f}%", "Semantic coverage", styles, card_width=card_w
+            ),
+            _metric_card(
+                f"{overview.unclassified_pct:.1f}%", "Low semantic fit", styles, card_width=card_w
+            ),
+            _metric_card(
+                f"{overview.visual_duplicates_pct:.1f}%", "Visual redundancy", styles, card_width=card_w
+            ),
+            _metric_card(str(overview.n_semantic_axes), "Semantic axes", styles, card_width=card_w),
             _metric_card(
                 f"{overview.largest_cluster_pct:.0f}% / {overview.smallest_cluster_pct:.0f}%",
                 "Largest / smallest cluster",
                 styles,
+                card_width=card_w,
             ),
         ]
-    n_cols = 3
-    rows = [cards[i : i + n_cols] for i in range(0, len(cards), n_cols)]
-    kpi_table = Table(rows, colWidths=[portrait_w / n_cols] * n_cols, hAlign="LEFT")
+    # 5 explicit columns (card, gap, card, gap, card) rather than 3
+    # equal-width cells with padding — each card's own width is already
+    # computed so this sums to exactly portrait_w, matching Axis sizes/
+    # the callout/the donuts. Same explicit-column approach as the donut
+    # table above, for the same reason: a fixed-width flowable inside a
+    # WIDER equal-width cell doesn't reliably reach that cell's own outer
+    # edge just by adjusting padding.
+    col_widths = [card_total_w, kpi_gap, card_total_w, kpi_gap, card_total_w]
+    rows = []
+    for i in range(0, len(cards), 3):
+        row_cards = cards[i : i + 3]
+        while len(row_cards) < 3:
+            row_cards.append("")
+        rows.append([row_cards[0], "", row_cards[1], "", row_cards[2]])
+    kpi_table = Table(rows, colWidths=col_widths, hAlign="LEFT")
     kpi_table.setStyle(
         TableStyle(
             [
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
                 ("TOPPADDING", (0, 0), (-1, -1), 4),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 0), (0, -1), "LEFT"),
+                ("ALIGN", (2, 0), (2, -1), "CENTER"),
+                ("ALIGN", (4, 0), (4, -1), "RIGHT"),
             ]
         )
     )
@@ -1594,9 +1741,11 @@ def generate_pdf_report(
         story.append(Spacer(1, SP_2))
         story.append(_Blueprint(_rl_image_for_width(bar_buf, portrait_w - 26), pad=6, margin=7))
 
-    # --- Landscape: donut charts ---------------------------------------
-    story.append(NextPageTemplate("Landscape"))
-    story.append(PageBreak())
+    # --- Donut charts ---------------------------------------------------
+    # Right under Axis sizes, on the SAME portrait page — a dedicated
+    # landscape page for these (tried previously) left an awkward amount
+    # of empty space below Axis sizes with a typical axis count, before
+    # the donuts even appeared on the following page.
     if comparing:
         coverage_buf = _render_donut_with_breakdown(
             "Semantic coverage",
@@ -1633,10 +1782,6 @@ def generate_pdf_report(
                 },
             ],
         )
-        # A bit wider than the single-dataset case — the composite image
-        # now stacks 3 pie charts (1 big + 2 mini), so the same width
-        # would make the mini donuts uncomfortably small.
-        chart_w = landscape_w * 0.34
     else:
         coverage_buf = _render_donut(
             ["Classified", "Unclassified"],
@@ -1650,26 +1795,51 @@ def generate_pdf_report(
             [MPL_ACCENT, MPL_NEUTRAL_300],
             "Visual redundancy",
         )
-        chart_w = landscape_w * 0.30
+
+    # Two donut cards side by side, with a fixed gap between them, sized
+    # so the COMBINED block's outer edges land exactly on portrait_w —
+    # the same left/right edges as the Axis sizes blueprint above and
+    # the KPI cards row below, rather than each card just centered
+    # within half the page (which doesn't guarantee matching outer
+    # edges). pad=4/margin=7 per card is unchanged from before.
+    donut_gap = 20
+    donut_total_w = (portrait_w - donut_gap) / 2
+    chart_w = donut_total_w - 2 * 4 - 2 * 7
     donut_table = Table(
         [
             [
                 _Blueprint(_rl_image_for_width(coverage_buf, chart_w), pad=4, margin=7),
+                "",
                 _Blueprint(_rl_image_for_width(duplicates_buf, chart_w), pad=4, margin=7),
             ]
         ],
-        colWidths=[landscape_w / 2, landscape_w / 2],
+        colWidths=[donut_total_w, donut_gap, donut_total_w],
+        hAlign="LEFT",
     )
-    donut_table.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER")]))
-    donut_table.wrap(landscape_w, landscape_h)
-    story.append(Spacer(1, max(0, (landscape_h - donut_table._height) / 2)))
+    donut_table.setStyle(
+        TableStyle(
+            [
+                ("ALIGN", (0, 0), (0, 0), "LEFT"),
+                ("ALIGN", (2, 0), (2, 0), "RIGHT"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
+    story.append(Spacer(1, SP_4))
     story.append(donut_table)
 
     # --- Representative images ----------------------------------------
     if representative_images:
         story.append(NextPageTemplate("Portrait"))
         story.append(PageBreak())
-        story.append(_section_header("What's in this dataset", styles, portrait_w))
+        story.append(
+            _section_header(
+                "What is in your datasets?" if comparing else "What is in your dataset?", styles, portrait_w
+            )
+        )
         story.append(Spacer(1, SP_3))
         story.append(
             Paragraph(
@@ -1737,22 +1907,29 @@ def generate_pdf_report(
 
     story.append(
         Paragraph(
-            f"Low semantic fit — {combined_unclassified_count:,} images "
+            f"What doesn't fit?: Low semantic fit — {combined_unclassified_count:,} images "
             f"({combined_unclassified_pct:.1f}%)",
             styles["section"],
         )
     )
     story.append(Spacer(1, SP_2))
     if low_fit_samples:
-        row = _sample_thumbnail_row(portrait_w, low_fit_samples, styles, dataset_names=low_fit_dataset_names)
+        row = _sample_thumbnail_row(
+            portrait_w,
+            low_fit_samples,
+            styles,
+            dataset_names=low_fit_dataset_names,
+            dedupe_keys=low_fit_dupe_keys,
+        )
         if row:
             story.append(row)
     story.append(Spacer(1, SP_4))
 
+    shown_duplicate_pct = (shown_duplicate_count / combined_total * 100) if combined_total else 0.0
     story.append(
         Paragraph(
-            f"Near duplicates — {combined_duplicate_count:,} images "
-            f"({combined_duplicates_pct:.1f}%)",
+            f"How much visual redundancy is there?: Near duplicates — {shown_duplicate_count:,} images "
+            f"({shown_duplicate_pct:.1f}%)",
             styles["section"],
         )
     )
@@ -1760,18 +1937,6 @@ def generate_pdf_report(
     for row in _flowing_thumbnail_grid(portrait_w, duplicate_groups or [], styles):
         story.append(row)
     story.append(Spacer(1, SP_4))
-
-    if cross_dataset_match_count:
-        story.append(
-            Paragraph(
-                f"Cross-dataset matches — {cross_dataset_match_count:,} images",
-                styles["section"],
-            )
-        )
-        story.append(Spacer(1, SP_2))
-        for row in _flowing_thumbnail_grid(portrait_w, cross_dataset_groups or [], styles):
-            story.append(row)
-        story.append(Spacer(1, SP_2))
 
     # Treemap — deliberately a different chart TYPE from "Axis sizes"
     # earlier in the report, so the two don't look like duplicates. Its
@@ -1781,16 +1946,30 @@ def generate_pdf_report(
     if overview.axis_sizes:
         story.append(NextPageTemplate("Landscape"))
         story.append(PageBreak())
+        diversity_header = _section_header(
+            "How diverse are they?" if comparing else "How diverse is it?", styles, landscape_w
+        )
+        _, header_h = diversity_header.wrap(landscape_w, landscape_h)
+        story.append(diversity_header)
+        story.append(Spacer(1, SP_4))
         treemap_buf = _render_treemap(combined_axis_sizes, axis_sizes_breakdown if comparing else None)
         treemap_frame = _Blueprint(_rl_image_for_width(treemap_buf, landscape_w - 26), pad=6, margin=7)
-        treemap_frame.wrap(landscape_w, landscape_h)
-        story.append(Spacer(1, max(0, (landscape_h - treemap_frame.height) / 2)))
+        remaining_h = landscape_h - header_h - SP_4
+        treemap_frame.wrap(landscape_w, remaining_h)
+        story.append(Spacer(1, max(0, (remaining_h - treemap_frame.height) / 2)))
         story.append(treemap_frame)
 
     # --- Landscape: dual radar comparison -----------------------------
     if radar_dominance_values and radar_normalized_values:
         story.append(NextPageTemplate("Landscape"))
         story.append(PageBreak())
+        header_h = 0.0
+        if comparing:
+            compare_header = _section_header("How do the two datasets compare?", styles, landscape_w)
+            _, header_h = compare_header.wrap(landscape_w, landscape_h)
+            story.append(compare_header)
+            story.append(Spacer(1, SP_4))
+            header_h += SP_4
         radar_labels = sorted(set(radar_dominance_values) | set(radar_normalized_values))
         radar_buf = _render_dual_radar(
             radar_labels,
@@ -1802,8 +1981,9 @@ def generate_pdf_report(
             compare_dataset_name,
         )
         radar_frame = _Blueprint(_rl_image_for_width(radar_buf, landscape_w - 26), pad=6, margin=7)
-        radar_frame.wrap(landscape_w, landscape_h)
-        story.append(Spacer(1, max(0, (landscape_h - radar_frame.height) / 2)))
+        remaining_h = landscape_h - header_h
+        radar_frame.wrap(landscape_w, remaining_h)
+        story.append(Spacer(1, max(0, (remaining_h - radar_frame.height) / 2)))
         story.append(radar_frame)
 
     # --- Landscape: UMAP scatter ---------------------------------------

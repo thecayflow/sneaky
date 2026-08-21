@@ -58,9 +58,8 @@ from src.similarity.phash import (
     DEFAULT_GROUP_THRESHOLD_BITS,
     build_grouped_chain,
     build_similarity_chain,
-    compute_cross_dataset_matches,
     compute_global_order,
-    get_all_duplicate_groups,
+    get_all_duplicate_groups_combined,
     get_or_compute_duplicate_stats,
     get_or_compute_global_order,
     get_or_compute_phashes,
@@ -1626,8 +1625,6 @@ if result is not None:
             # cards/bar chart broken down by dataset instead of only the
             # primary feed's own numbers.
             overview_compare = None
-            cross_dataset_match_count = None
-            cross_dataset_groups = None
             if compare_result is not None:
                 compare_report_phashes = get_or_compute_phashes(
                     compare_result["path"], compare_result["paths"]
@@ -1640,32 +1637,6 @@ if result is not None:
                     total_images=len(compare_result["paths"]),
                     duplicate_image_count=compare_duplicate_stats["n_duplicate_images"],
                 )
-
-                # Cross-dataset near-duplicates — reuses the pHashes already
-                # computed just above for each dataset's own stats, no new
-                # hashing pass needed. Every group is shown in the PDF (not
-                # just the biggest), largest first — same "biggest evidence
-                # first" convention as build_grouped_chain. Capping to a
-                # readable number of thumbnails PER group (not how many
-                # groups get shown) happens inside _sample_thumbnail_row.
-                cross_dataset_groups = compute_cross_dataset_matches(
-                    result["paths"], report_phashes, compare_result["paths"], compare_report_phashes
-                )
-                cross_dataset_groups.sort(key=len, reverse=True)
-                cross_dataset_match_count = sum(len(g) for g in cross_dataset_groups)
-                # Tag each image with which dataset it came from, so the
-                # PDF can color-code the caption (same convention as
-                # everywhere else two datasets are shown) — set membership
-                # check, since compute_cross_dataset_matches itself just
-                # returns plain mixed-origin Path lists.
-                primary_paths_set = {str(p) for p in result["paths"]}
-                cross_dataset_groups = [
-                    [
-                        (p, result["dataset_name"] if str(p) in primary_paths_set else compare_result["dataset_name"])
-                        for p in group
-                    ]
-                    for group in cross_dataset_groups
-                ]
 
             representative_pairs = get_representative_images_by_axis(full_axes)
             # Custom axes have no centroid image of their own — fall back to
@@ -1710,29 +1681,34 @@ if result is not None:
                     standardize_reference=standardize_reference,
                 )
             ]
-            # ALL near-duplicate groups (not just a sample from the
-            # biggest one) — combined size-descending, primary's own
-            # groups first when tied, so the flowing thumbnail grid in
-            # the PDF packs the paper efficiently instead of one row per
-            # group with wasted blank cells.
-            duplicate_groups = [
-                [(p, result["dataset_name"]) for p in group]
-                for group in get_all_duplicate_groups(
-                    result["paths"], report_phashes, threshold_bits=DEFAULT_GROUP_THRESHOLD_BITS
-                )
-            ]
+            # ALL near-duplicate groups — pooled across both datasets in a
+            # SINGLE pass when comparing, so a group can end up entirely
+            # from one dataset OR span both, with no separate "Near
+            # duplicates" vs "Cross-dataset matches" split; the reader
+            # sees which is which from the color-coded captions
+            # (steel-blue/amber) instead of two sections to reconcile.
+            # Every group is shown in the PDF (not just the biggest),
+            # largest first — same "biggest evidence first" convention as
+            # build_grouped_chain. Capping to a readable number of
+            # thumbnails per group happens inside _flowing_thumbnail_grid.
+            duplicate_groups = get_all_duplicate_groups_combined(
+                result["paths"],
+                report_phashes,
+                result["dataset_name"],
+                compare_result["paths"] if compare_result is not None else None,
+                compare_report_phashes if compare_result is not None else None,
+                compare_result["dataset_name"] if compare_result is not None else None,
+                threshold_bits=DEFAULT_GROUP_THRESHOLD_BITS,
+            )
+            duplicate_match_count = sum(len(g) for g in duplicate_groups)
             low_fit_dataset_names = [result["dataset_name"]] * len(low_fit_samples)
 
-            # Combined low-fit samples + near-duplicate groups from BOTH
-            # datasets when comparing — previously these (unlike the KPI
-            # cards, already fixed) only ever reflected the primary feed,
-            # which could show e.g. "0 near duplicates" in the PDF while
-            # the app's own duplicate view showed matches that turned out
-            # to live entirely in the comparison feed. The combined
-            # COUNTS for the callout/section headers are computed inside
-            # generate_pdf_report itself, from overview/overview_compare
-            # (same as it already does for the KPI cards) — no need to
-            # duplicate that here.
+            # Combined low-fit samples from BOTH datasets when comparing —
+            # previously this (unlike the KPI cards, already fixed) only
+            # ever reflected the primary feed. The combined COUNT for the
+            # callout/section header is computed inside generate_pdf_report
+            # itself, from overview/overview_compare (same as it already
+            # does for the KPI cards) — no need to duplicate that here.
             if compare_result is not None:
                 compare_low_fit = get_ranked_images_for_axis(
                     compare_result["embeddings"],
@@ -1745,13 +1721,16 @@ if result is not None:
                 low_fit_samples += [p for p, _score in compare_low_fit]
                 low_fit_dataset_names += [compare_result["dataset_name"]] * len(compare_low_fit)
 
-                duplicate_groups += [
-                    [(p, compare_result["dataset_name"]) for p in group]
-                    for group in get_all_duplicate_groups(
-                        compare_result["paths"], compare_report_phashes, threshold_bits=DEFAULT_GROUP_THRESHOLD_BITS
-                    )
-                ]
-            duplicate_groups.sort(key=len, reverse=True)
+            # For each low-fit image, which near-duplicate group (if any)
+            # it belongs to — lets the PDF's "Low semantic fit" sample
+            # selection avoid picking 2+ images that are themselves
+            # near-duplicates of each other, when a distinct alternative
+            # is available (see _sample_thumbnail_row's dedupe_keys).
+            duplicate_group_key_by_path: dict[str, int] = {}
+            for gi, group in enumerate(duplicate_groups):
+                for p, _name in group:
+                    duplicate_group_key_by_path[str(p)] = gi
+            low_fit_dupe_keys = [duplicate_group_key_by_path.get(str(p)) for p in low_fit_samples]
 
             # Both radar variants, over the same full_axes (auto + custom).
             radar_dominance_values = get_radar_values_by_dominance(
@@ -1841,10 +1820,10 @@ if result is not None:
                 overview=overview,
                 representative_images=representative_pairs,
                 low_fit_samples=low_fit_samples,
+                low_fit_dupe_keys=low_fit_dupe_keys,
                 low_fit_dataset_names=low_fit_dataset_names,
                 duplicate_groups=duplicate_groups,
-                cross_dataset_match_count=cross_dataset_match_count,
-                cross_dataset_groups=cross_dataset_groups,
+                duplicate_match_count=duplicate_match_count,
                 radar_dominance_values=radar_dominance_values,
                 radar_normalized_values=radar_normalized_values,
                 radar_dominance_values_compare=radar_dominance_values_compare,

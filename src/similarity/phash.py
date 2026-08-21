@@ -363,6 +363,54 @@ def get_all_duplicate_groups(
     return multi_groups
 
 
+def get_all_duplicate_groups_combined(
+    paths_a: list[Path],
+    hashes_a: dict[str, imagehash.ImageHash],
+    dataset_name_a: str,
+    paths_b: list[Path] | None = None,
+    hashes_b: dict[str, imagehash.ImageHash] | None = None,
+    dataset_name_b: str | None = None,
+    threshold_bits: int = DEFAULT_GROUP_THRESHOLD_BITS,
+) -> list[list[tuple[Path, str]]]:
+    """
+    ALL near-duplicate groups (2+ members), largest first — pooling BOTH
+    datasets together in a SINGLE grouping pass when a second one is
+    given, rather than computing "within-dataset duplicates" and
+    "cross-dataset matches" as two separate things. A group can end up
+    entirely from one dataset, or span both — that distinction is left
+    for the reader to notice from the color-coded captions (steel-blue/
+    amber), not baked into two separate report sections with a fairly
+    arbitrary same-vs-cross split to mentally reconcile.
+
+    Each group is a list of (Path, dataset_name) tuples. When paths_b is
+    None, behaves exactly like get_all_duplicate_groups but with the
+    same (Path, dataset_name) tagging for a consistent return shape.
+    """
+    if paths_b is not None and hashes_b is not None:
+        pooled_paths = list(paths_a) + list(paths_b)
+        pooled_hashes = {**hashes_a, **hashes_b}
+        set_a = {str(p) for p in paths_a}
+    else:
+        pooled_paths = list(paths_a)
+        pooled_hashes = hashes_a
+        set_a = None
+
+    available, groups = _compute_duplicate_groups(pooled_paths, pooled_hashes, threshold_bits)
+
+    result_groups: list[list[tuple[Path, str]]] = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        tagged = []
+        for i in members:
+            p = available[i]
+            name = dataset_name_a if set_a is None or str(p) in set_a else dataset_name_b
+            tagged.append((p, name))
+        result_groups.append(tagged)
+    result_groups.sort(key=len, reverse=True)
+    return result_groups
+
+
 def build_grouped_chain(
     paths: list[Path],
     hashes: dict[str, imagehash.ImageHash],
