@@ -1,17 +1,18 @@
-# imagedata_viz — requirements
+# sneaky — requirements
 #
-# IMPORTANTE: instala PyTorch en dos pasos, no con un solo
-# `pip install -r requirements.txt`, o pip puede darte la build de CPU
-# en vez de la de CUDA:
+# IMPORTANT: install PyTorch in two separate steps, not with a single
+# `pip install -r requirements.txt`, or pip may give you the CPU build
+# instead of the CUDA one:
 #
 #   1) pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 #   2) pip install -r requirements.txt
 #
-# Requiere una GPU NVIDIA con drivers recientes (no hace falta instalar
-# el CUDA Toolkit por separado — la rueda de PyTorch ya lo incluye).
-# Sin GPU NVIDIA, la app funciona pero muy lenta (no probado en CPU).
+# Requires an NVIDIA GPU with recent drivers (no need to install the
+# CUDA Toolkit separately — the PyTorch wheel already bundles it).
+# Without an NVIDIA GPU, the app still runs but very slowly (not tested
+# on CPU).
 #
-# Tras instalar lo de abajo, descarga también el modelo de spaCy:
+# After installing the packages below, also download the spaCy model:
 #   python -m spacy download en_core_web_sm
 
 open_clip_torch
@@ -30,3 +31,4 @@ umap-learn
 ImageHash
 reportlab
 matplotlib
+PyWavelets

@@ -1,0 +1,100 @@
+SNEAKY EVALUATION LICENSE 1.0
+
+Copyright (c) 2026 Víctor Sánchez
+All rights reserved.
+
+1. PURPOSE
+
+Sneaky is made available in source code form for personal evaluation,
+testing, educational use, and non-commercial experimentation.
+
+Subject to the terms of this License, you are granted a limited,
+non-exclusive, non-transferable, revocable license to download, install,
+run, and evaluate the Software.
+
+2. PERMITTED USE
+
+You may:
+
+- Download and install the Software.
+- Run and evaluate the Software on your own hardware.
+- Use the Software with your own datasets for personal, educational,
+  research, testing, or internal evaluation purposes.
+- Inspect the source code for the purpose of understanding or evaluating
+  the Software.
+- Report bugs, suggest improvements, or provide feedback to the copyright
+  holder.
+
+3. RESTRICTIONS
+
+Without prior written permission from the copyright holder, you may not:
+
+- Use the Software for commercial purposes.
+- Sell, license, sublicense, rent, lease, distribute, or otherwise make
+  the Software available to third parties.
+- Redistribute the Software, in whole or in part.
+- Redistribute modified versions of the Software.
+- Create, distribute, sell, license, or commercially exploit derivative
+  works based on the Software.
+- Incorporate any substantial portion of the Software into another product,
+  service, library, platform, or software project.
+- Offer the Software, or any substantially similar derivative based on the
+  Software, as a hosted service, SaaS product, API, or other commercial
+  service.
+- Remove, alter, or obscure any copyright, trademark, attribution, or
+  proprietary notice contained in the Software.
+- Use the Software or its source code to develop or commercialize a
+  competing product or service.
+
+4. OWNERSHIP
+
+The Software, including its source code, architecture, algorithms,
+documentation, branding, name, trademarks, and all associated intellectual
+property rights, remains the exclusive property of the copyright holder.
+
+No ownership rights are transferred under this License.
+
+5. FEEDBACK
+
+You may voluntarily provide feedback, suggestions, bug reports, or other
+comments regarding the Software.
+
+The copyright holder may use such feedback without restriction or
+compensation, unless otherwise agreed in writing.
+
+6. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, OR PERFORMANCE.
+
+USE OF THE SOFTWARE IS ENTIRELY AT YOUR OWN RISK.
+
+7. LIMITATION OF LIABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE COPYRIGHT HOLDER
+SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OF THE
+SOFTWARE.
+
+8. TERMINATION
+
+This License terminates automatically if you fail to comply with any of its
+terms.
+
+Upon termination, you must immediately cease all use of the Software and
+delete all copies in your possession or control.
+
+9. COMMERCIAL LICENSING
+
+Commercial use, redistribution, derivative works, integration into another
+product or service, or any use not expressly permitted under this License
+requires prior written permission from the copyright holder.
+
+For commercial licensing inquiries, contact:
+info [at] thecayflow.com
+
+10. GOVERNING LAW
+
+This License shall be governed by and construed in accordance with the laws
+of Spain, without regard to its conflict of law provisions.

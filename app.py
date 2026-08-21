@@ -38,6 +38,7 @@ pillow_heif.register_heif_opener()
 
 from src.axes.custom import create_custom_axis
 from src.axes.hierarchical import MIN_AXES
+from src.axes.labeling import ClusterLabeler
 from src.embeddings.clip_embedder import ClipEmbedder
 from src.persistence import cache
 from src.pipeline import get_embeddings_only, run_pipeline
@@ -67,6 +68,11 @@ from src.similarity.phash import (
 from src.report.metrics import compute_overview_metrics, get_representative_images_by_axis
 from src.report.pdf_report import generate_pdf_report
 from src.scoring.dataset_similarity import compute_clip_mmd, compute_self_split_mmd
+from src.scoring.wavelet_similarity import (
+    compute_wavelet_mmd,
+    compute_wavelet_self_split_mmd,
+    get_or_compute_wavelet_features,
+)
 from src.viz.umap_projection import compute_umap_projection, get_or_compute_umap
 
 MAX_AXES = 25  # soft cap for the + button; raising axis count re-runs captioning
@@ -83,10 +89,27 @@ st.caption(
 )
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def get_embedder() -> ClipEmbedder:
     """Loaded once per Streamlit session and reused for custom axis text embeddings."""
     return ClipEmbedder()
+
+
+@st.cache_resource(show_spinner=False)
+def get_labeler() -> ClusterLabeler:
+    """Loaded once per Streamlit session — avoids reloading BLIP's model
+    weights every time a new (k, linkage_method) combination needs
+    captioning within the same session (each new combination still does
+    its own captioning work, just without re-loading the model first).
+
+    show_spinner=False on both this and get_embedder(): the caller already
+    wraps the whole operation (Analyze / Load comparison feed) in its own
+    st.spinner with a more specific message — without this, Streamlit's
+    own generic "Running get_embedder()." spinner briefly overlaps with
+    it the first time each is genuinely loaded in a session, which reads
+    as two spinners for one wait. Purely cosmetic — no change to what
+    gets cached or when."""
+    return ClusterLabeler()
 
 
 def _image_to_base64_thumb(path: Path, max_size: int = SIMILARITY_CHAIN_THUMB_SIZE) -> str | None:
@@ -174,7 +197,9 @@ def run_analysis(path: str, k: int, linkage_method: str) -> None:
 
     with st.spinner(spinner_msg):
         try:
-            axes = run_pipeline(path, k=k, linkage_method=linkage_method)
+            axes = run_pipeline(
+                path, k=k, linkage_method=linkage_method, embedder=get_embedder(), labeler=get_labeler()
+            )
             loaded = cache.load_scan_and_embeddings(path)
             if loaded is None:
                 st.error("Pipeline ran but no cached embeddings were found — please retry.")
@@ -781,7 +806,7 @@ with st.expander("Compare with a second feed (optional)"):
                 "since it reuses the primary feed's axes."
             ):
                 try:
-                    c_paths, c_embeddings, _ = get_embeddings_only(compare_path)
+                    c_paths, c_embeddings, _ = get_embeddings_only(compare_path, embedder=get_embedder())
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"Something went wrong loading this feed: {exc}")
                     c_paths = None
@@ -1602,8 +1627,9 @@ if result is not None:
 
     if st.button("📄 Generate PDF Report", type="primary"):
         with st.spinner(
-            "Building PDF report... if UMAP hasn't been computed for this dataset yet, "
-            "this can take a while the first time (cached afterward)."
+            "Building PDF report... if UMAP hasn't been computed for this dataset yet, or "
+            "you're comparing two datasets for the first time (wavelet texture analysis reads "
+            "every image, cached afterward), this can take a while the first time."
         ):
             # get_or_compute_phashes has its own disk cache — this is a
             # cheap cache-hit in virtually all cases (the Visual similarity
@@ -1807,6 +1833,8 @@ if result is not None:
             # "noise floor" to read the cross-feed number against.
             clip_mmd_value = None
             clip_mmd_baseline_value = None
+            wavelet_mmd_value = None
+            wavelet_mmd_baseline_value = None
             compare_dataset_name = None
             if compare_result is not None:
                 clip_mmd_value = compute_clip_mmd(
@@ -1814,6 +1842,26 @@ if result is not None:
                 )
                 clip_mmd_baseline_value = compute_self_split_mmd(result["embeddings"])
                 compare_dataset_name = compare_result["dataset_name"]
+
+                # Wavelet-MMD — same idea, but over texture statistics
+                # instead of CLIP's semantic space; complementary, catches
+                # differences CLIP wouldn't be sensitive to (sensor noise,
+                # compression, rendering engine). Unlike CLIP-MMD, this
+                # needs its own pass reading every image the first time (no
+                # existing embeddings to reuse) — cached to disk afterward
+                # (get_or_compute_wavelet_features), same convention as
+                # phash's own disk cache.
+                _primary_wavelet_paths, primary_wavelet_features = get_or_compute_wavelet_features(
+                    result["path"], result["paths"]
+                )
+                _compare_wavelet_paths, compare_wavelet_features = get_or_compute_wavelet_features(
+                    compare_result["path"], compare_result["paths"]
+                )
+                if primary_wavelet_features.size and compare_wavelet_features.size:
+                    wavelet_mmd_value = compute_wavelet_mmd(
+                        primary_wavelet_features, compare_wavelet_features
+                    )
+                    wavelet_mmd_baseline_value = compute_wavelet_self_split_mmd(primary_wavelet_features)
 
             st.session_state.pdf_report_bytes = generate_pdf_report(
                 dataset_name=result["dataset_name"],
@@ -1834,6 +1882,8 @@ if result is not None:
                 umap_dataset_display_names=umap_dataset_display_names,
                 clip_mmd=clip_mmd_value,
                 clip_mmd_baseline=clip_mmd_baseline_value,
+                wavelet_mmd=wavelet_mmd_value,
+                wavelet_mmd_baseline=wavelet_mmd_baseline_value,
                 compare_dataset_name=compare_dataset_name,
                 overview_compare=overview_compare,
             )

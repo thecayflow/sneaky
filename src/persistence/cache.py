@@ -8,12 +8,16 @@ processed again.
 
 Cache layout (relative to project root):
     cache/<dataset_hash>/
-        meta.json          # root path, image count, timestamp
-        paths.json         # image paths, aligned 1:1 with embeddings.npz
-        skipped.json       # images that failed to load/embed, with reason
-        embeddings.npz      # CLIP embeddings array
-        tree.npz             # hierarchical clustering linkage matrix (Z)
-        axes_k<K>.json        # per-k: labeled clusters (centroids, members, captions)
+        meta.json           # root path, image count, timestamp
+        paths.json          # image paths, aligned 1:1 with embeddings.npz
+        mtimes.json          # {path_str: modification_time}, for detecting in-place edits
+        skipped.json        # images that failed to load/embed, with reason
+        embeddings.npz       # CLIP embeddings array
+        tree.npz              # hierarchical clustering linkage matrix (Z)
+        axes_k<K>.json         # per-k: labeled clusters (centroids, members, captions)
+        phashes.json         # perceptual hashes, for near-duplicate detection
+        wavelet_paths.json   # image paths, aligned 1:1 with wavelet_features.npz
+        wavelet_features.npz  # wavelet texture feature vectors, for Wavelet-MMD
 
 <dataset_hash> is derived from the resolved absolute folder path, so
 pointing the app at the same folder twice reuses the same cache entry, and
@@ -69,7 +73,18 @@ def save_scan_and_embeddings(
     paths: list[Path],
     embeddings: np.ndarray,
     skipped: list[tuple[Path, str]],
+    mtimes: dict[str, float] | None = None,
 ) -> None:
+    """
+    mtimes: optional {path_str: modification_time} for every path in
+    `paths` — lets _update_embeddings_incrementally detect when an
+    EXISTING file's content changed (edited in place, same filename) on
+    a later run, not just files added or removed. Written to its own
+    mtimes.json (not merged into paths.json) so this stays a purely
+    additive, backward-compatible change — a cache written before this
+    existed simply has no mtimes.json, and load_mtimes returns None for
+    it (see there for how that case is handled).
+    """
     cache_dir = _dataset_cache_dir(root_path)
 
     np.savez_compressed(cache_dir / "embeddings.npz", embeddings=embeddings)
@@ -92,7 +107,27 @@ def save_scan_and_embeddings(
         ),
         encoding="utf-8",
     )
+    if mtimes is not None:
+        (cache_dir / "mtimes.json").write_text(
+            json.dumps(mtimes, indent=2), encoding="utf-8"
+        )
     logger.info("Cached scan + embeddings for %s at %s", root_path, cache_dir)
+
+
+def load_mtimes(root_path: str | Path) -> dict[str, float] | None:
+    """
+    {path_str: modification_time}, or None if this dataset's cache
+    predates mtime tracking (no mtimes.json yet) — the caller should
+    treat None (and a missing entry for any individual path) as "unknown,
+    assume unchanged" rather than as evidence of a change, so existing
+    caches aren't forced through a one-time full re-embed just because
+    they don't have this metadata yet.
+    """
+    cache_dir = _dataset_cache_dir(root_path)
+    mtimes_file = cache_dir / "mtimes.json"
+    if not mtimes_file.exists():
+        return None
+    return json.loads(mtimes_file.read_text(encoding="utf-8"))
 
 
 def load_scan_and_embeddings(
@@ -256,6 +291,35 @@ def load_phashes(root_path: str | Path) -> dict[str, str] | None:
     hashes = json.loads(phashes_file.read_text(encoding="utf-8"))
     logger.info("Loaded %d cached perceptual hashes for %s", len(hashes), root_path)
     return hashes
+
+
+def save_wavelet_features(root_path: str | Path, paths: list[Path], features: np.ndarray) -> None:
+    """
+    `features` is an (n_images, n_features) array, row-aligned 1:1 with
+    `paths` — same array-plus-paths-file convention as embeddings.npz/
+    paths.json, kept as its own separate pair of files (rather than reusing
+    paths.json) since wavelet feature extraction can legitimately skip an
+    image that the main embedding pass didn't (or vice versa), so the two
+    path lists aren't guaranteed to match row-for-row.
+    """
+    cache_dir = _dataset_cache_dir(root_path)
+    np.savez_compressed(cache_dir / "wavelet_features.npz", features=features)
+    (cache_dir / "wavelet_paths.json").write_text(
+        json.dumps([str(p) for p in paths], ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    logger.info("Cached %d wavelet feature vectors for %s", len(paths), root_path)
+
+
+def load_wavelet_features(root_path: str | Path) -> tuple[list[Path], np.ndarray] | None:
+    cache_dir = _dataset_cache_dir(root_path)
+    features_file = cache_dir / "wavelet_features.npz"
+    paths_file = cache_dir / "wavelet_paths.json"
+    if not features_file.exists() or not paths_file.exists():
+        return None
+    features = np.load(features_file)["features"]
+    paths = [Path(p) for p in json.loads(paths_file.read_text(encoding="utf-8"))]
+    logger.info("Loaded %d cached wavelet feature vectors for %s", len(paths), root_path)
+    return paths, features
 
 
 def save_global_order(root_path: str | Path, chain: list[tuple[str, int | None]]) -> None:

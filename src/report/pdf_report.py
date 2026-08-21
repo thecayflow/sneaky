@@ -39,6 +39,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 import numpy as np
 from PIL import Image, ImageOps
 from reportlab.lib import colors
+from reportlab.lib.enums import TA_JUSTIFY
 from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
@@ -338,7 +339,12 @@ def _make_styles() -> dict[str, ParagraphStyle]:
             "body", fontName=FONT["body_regular"], fontSize=9.5, textColor=COLOR_NEUTRAL_700, leading=13.5
         ),
         "callout_body": ParagraphStyle(
-            "callout_body", fontName=FONT["body_regular"], fontSize=9.5, textColor=COLOR_TEXT, leading=14
+            "callout_body",
+            fontName=FONT["body_regular"],
+            fontSize=9.5,
+            textColor=COLOR_TEXT,
+            leading=14,
+            alignment=TA_JUSTIFY,
         ),
     }
 
@@ -431,6 +437,84 @@ def _metric_card(
     inner = Table(rows, colWidths=[col_width] * n_cols)
     inner.setStyle(TableStyle(style_commands))
     return _Blueprint(inner, pad=2, margin=7)
+
+
+def _truncate_label(text: str, max_chars: int) -> str:
+    """
+    Truncates to a fixed character budget with an ellipsis — so a long
+    dataset name can't stretch a compact chart's label column and throw
+    off the whole layout. Used for the MMD bar chart's dataset names,
+    which have no natural length limit (they're whatever folder name the
+    user picked).
+    """
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "\u2026"
+
+
+def _render_mmd_bar_chart(
+    primary_name: str, compare_name: str, cross_value: float, baseline_value: float, x_label: str
+) -> io.BytesIO:
+    """
+    Small horizontal bar chart for an MMD-style callout line (CLIP-MMD or
+    Wavelet-MMD) — the cross-dataset distance next to the same-dataset
+    self-split baseline, so the reader can see at a glance how far above
+    the baseline (the sampling "noise floor") the cross-dataset number
+    sits, rather than having to hold both numbers in their head from the
+    text alone. Sits next to its paragraph inside the same callout
+    blueprint, not as a separate section.
+
+    The cross-dataset bar's label is two lines (primary name, then "vs
+    <compare name>"), right-aligned as a block, rather than one line —
+    dataset names have no length limit (whatever folder the user picked),
+    and a single "primary vs compare" line can get wide enough to crowd
+    out the bars themselves in this deliberately compact chart. Each name
+    is separately truncated with an ellipsis if it's still too long for
+    this narrow a column even split across two lines.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(2.05, 1.05), dpi=200)
+    max_chars = 14
+    primary_short = _truncate_label(primary_name, max_chars)
+    compare_short = _truncate_label(compare_name, max_chars)
+    cross_label = f"{primary_short}\nvs {compare_short}"
+    labels = [cross_label, "Random halves,\nsame dataset"]
+    values = [cross_value, baseline_value]
+    colors = [MPL_ACCENT, MPL_NEUTRAL_300]
+    y_pos = [1, 0]
+    bars = ax.barh(y_pos, values, color=colors, height=0.55)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(
+        labels, fontsize=6, color=MPL_TEXT, ha="right", multialignment="right", **_mpl_font("regular")
+    )
+    ax.set_xlabel(x_label, fontsize=6, color=MPL_NEUTRAL_600, **_mpl_font("regular"))
+    ax.tick_params(axis="x", labelsize=5.5, colors=MPL_NEUTRAL_600, length=2)
+    max_val = max(values) if max(values) > 0 else 1.0
+    ax.set_xlim(0, max_val * 1.4)
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_width() + max_val * 0.04,
+            bar.get_y() + bar.get_height() / 2,
+            f"{val:.3f}",
+            va="center",
+            fontsize=6,
+            color=MPL_TEXT,
+            **_mpl_font("bold"),
+        )
+    for spine in ("top", "right", "left"):
+        ax.spines[spine].set_visible(False)
+    ax.spines["bottom"].set_color(MPL_NEUTRAL_300)
+    fig.tight_layout(pad=0.3)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=200, transparent=True, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
 
 def _render_donut(
@@ -1404,6 +1488,8 @@ def generate_pdf_report(
     umap_dataset_display_names: dict[str, str] | None = None,
     clip_mmd: float | None = None,
     clip_mmd_baseline: float | None = None,
+    wavelet_mmd: float | None = None,
+    wavelet_mmd_baseline: float | None = None,
     compare_dataset_name: str | None = None,
     overview_compare: DatasetOverviewMetrics | None = None,
 ) -> bytes:
@@ -1508,35 +1594,81 @@ def generate_pdf_report(
         duplicate_match_count if duplicate_match_count is not None else combined_duplicate_count
     )
 
-    callout_lines = []
+    callout_items: list[dict] = []
     if combined_unclassified_count > 0:
-        callout_lines.append(
-            f"<b>{combined_unclassified_count:,} images have low semantic fit.</b> "
-            "They don't strongly match any of the detected themes — worth a quick "
-            "look to confirm they belong in this dataset."
+        callout_items.append(
+            {
+                "text": f"<b>{combined_unclassified_count:,} images have low semantic fit.</b> "
+                "They don't strongly match any of the detected themes — worth a quick "
+                "look to confirm they belong in this dataset."
+            }
         )
     if shown_duplicate_count > 0:
-        callout_lines.append(
-            f"<b>{shown_duplicate_count:,} images belong to near-duplicate groups.</b> "
-            "This may be expected (e.g. burst-mode photos, or the same subject "
-            "appearing in both datasets) or a sign of redundancy, depending on what "
-            "this dataset is for."
+        callout_items.append(
+            {
+                "text": f"<b>{shown_duplicate_count:,} images belong to near-duplicate groups.</b> "
+                "This may be expected (e.g. burst-mode photos, or the same subject "
+                "appearing in both datasets) or a sign of redundancy, depending on what "
+                "this dataset is for."
+            }
         )
     if clip_mmd is not None and clip_mmd_baseline is not None and compare_dataset_name:
-        callout_lines.append(
-            f"<b>Compared with \u201c{compare_dataset_name}\u201d: distributional "
-            f"distance {clip_mmd:.3f}.</b> For reference, splitting this dataset "
-            f"into two random halves gives {clip_mmd_baseline:.3f} \u2014 that's "
-            "roughly the gap you'd expect from sampling alone, even between two "
-            "halves of the exact same dataset. A distance well above that suggests "
-            "a genuinely different overall makeup; a distance close to it suggests "
-            "the two are hard to tell apart, distribution-wise."
+        callout_items.append(
+            {
+                "text": f"<b>Compared with \u201c{compare_dataset_name}\u201d: distributional "
+                f"distance {clip_mmd:.3f}.</b> For reference, splitting this dataset "
+                f"into two random halves gives {clip_mmd_baseline:.3f} \u2014 that's "
+                "roughly the gap you'd expect from sampling alone, even between two "
+                "halves of the exact same dataset. A distance well above that suggests "
+                "a genuinely different overall makeup; a distance close to it suggests "
+                "the two are hard to tell apart, distribution-wise.",
+                "chart": _render_mmd_bar_chart(
+                    dataset_name,
+                    compare_dataset_name,
+                    clip_mmd,
+                    clip_mmd_baseline,
+                    "Distributional distance",
+                ),
+            }
         )
-    if callout_lines:
+    if wavelet_mmd is not None and wavelet_mmd_baseline is not None and compare_dataset_name:
+        callout_items.append(
+            {
+                "text": f"<b>Texture distance from \u201c{compare_dataset_name}\u201d: "
+                f"{wavelet_mmd:.3f}.</b> This looks at low-level visual texture "
+                f"(not subject matter) \u2014 splitting this dataset into two random "
+                f"halves gives {wavelet_mmd_baseline:.3f} as a reference. Two datasets "
+                "can be texturally similar even when the distributional distance above "
+                "says they differ in subject matter, or vice versa \u2014 different "
+                "cameras, compression, or rendering can show up here even when the "
+                "content itself looks the same.",
+                "chart": _render_mmd_bar_chart(
+                    dataset_name,
+                    compare_dataset_name,
+                    wavelet_mmd,
+                    wavelet_mmd_baseline,
+                    "Texture distance",
+                ),
+            }
+        )
+    if callout_items:
+        chart_col_w = 150
+        gap_col_w = 10
+        text_col_w = (portrait_w - 34) - chart_col_w - gap_col_w
+
+        callout_rows = [[Paragraph("What should I look at?", styles["section"]), "", ""]]
+        span_commands = [("SPAN", (0, 0), (2, 0))]
+        for i, item in enumerate(callout_items, start=1):
+            text_cell = Paragraph(item["text"], styles["callout_body"])
+            if item.get("chart") is not None:
+                chart_cell = _rl_image_for_width(item["chart"], chart_col_w)
+                callout_rows.append([text_cell, "", chart_cell])
+            else:
+                callout_rows.append([text_cell, "", ""])
+                span_commands.append(("SPAN", (0, i), (2, i)))
+
         callout_inner = Table(
-            [[Paragraph("What should I look at?", styles["section"])]]
-            + [[Paragraph(line, styles["callout_body"])] for line in callout_lines],
-            colWidths=[portrait_w - 34],
+            callout_rows, colWidths=[text_col_w, gap_col_w, chart_col_w]
         )
         callout_inner.setStyle(
             TableStyle(
@@ -1547,6 +1679,8 @@ def generate_pdf_report(
                     ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
                     ("TOPPADDING", (0, 1), (-1, -1), 3),
                     ("BOTTOMPADDING", (0, -1), (-1, -1), 0),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    *span_commands,
                 ]
             )
         )
