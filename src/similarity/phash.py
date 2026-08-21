@@ -238,6 +238,44 @@ def _compute_duplicate_groups(
     return available, groups
 
 
+def compute_cross_dataset_matches(
+    paths_a: list[Path],
+    hashes_a: dict[str, imagehash.ImageHash],
+    paths_b: list[Path],
+    hashes_b: dict[str, imagehash.ImageHash],
+    threshold_bits: int = DEFAULT_GROUP_THRESHOLD_BITS,
+) -> list[list[Path]]:
+    """
+    Near-duplicate groups that span BOTH datasets — i.e. images from
+    dataset A and dataset B close enough (Hamming distance <=
+    threshold_bits) to be the same underlying photo. Reuses the same
+    connected-components grouping as compute_duplicate_stats/
+    build_grouped_chain, just fed the POOLED hashes of both datasets —
+    groups that turn out to contain paths from only one dataset are
+    filtered out here, since those are ordinary within-dataset
+    duplicates, not the cross-dataset signal this function is for.
+
+    Returns a list of groups, each a list of Paths (from either
+    dataset) — the caller can check `path in paths_a` / `path in
+    paths_b` to tell which dataset a given member came from.
+    """
+    pooled_paths = list(paths_a) + list(paths_b)
+    pooled_hashes = {**hashes_a, **hashes_b}
+    available, groups = _compute_duplicate_groups(pooled_paths, pooled_hashes, threshold_bits)
+
+    set_a = {str(p) for p in paths_a}
+    cross_groups: list[list[Path]] = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        member_paths = [available[i] for i in members]
+        has_a = any(str(p) in set_a for p in member_paths)
+        has_b = any(str(p) not in set_a for p in member_paths)
+        if has_a and has_b:
+            cross_groups.append(member_paths)
+    return cross_groups
+
+
 def compute_duplicate_stats(
     paths: list[Path],
     hashes: dict[str, imagehash.ImageHash],

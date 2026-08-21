@@ -692,14 +692,22 @@ def _render_treemap(
     "Cluster imbalance" as a treemap — visually distinct from the plain
     "Axis sizes" bar chart earlier in the report. Rectangles too small to
     hold a readable label are left blank rather than overflowing text
-    onto neighboring cells.
+    onto neighboring cells. Its own landscape page in the report (see
+    generate_pdf_report) — more room than portrait for each sub-box's
+    own label when comparing two datasets.
 
     axis_sizes_breakdown, if given: label -> list of {"value": int,
     "color": hex, "name": str} (one entry per dataset, matching
     axis_sizes' totals) — each axis's rectangle is split into sub-boxes,
     one per dataset, colored by dataset (with a small legend) instead of
-    shaded by relative size. None (the default) renders exactly as
-    before — size-shaded rectangles, no split, no legend.
+    shaded by relative size. The axis name sits near the TOP of the full
+    rectangle (not centered) specifically so it doesn't visually compete
+    with each sub-box's own percentage, shown centered within that
+    sub-box when there's room — otherwise (with a dominant dataset) the
+    smaller sub-box was reading as unlabeled, just a bare color with
+    nothing of its own. None (the default) renders exactly as before —
+    size-shaded rectangles, no split, no legend, label centered as one
+    block.
     """
     import matplotlib
 
@@ -711,12 +719,12 @@ def _render_treemap(
     labels = [k for k, _ in items]
     values = [v for _, v in items]
 
-    W, H = 700.0, 420.0
+    W, H = 900.0, 380.0
     total = sum(values) if values else 1
     scaled = [v / total * (W * H) for v in values]
     rects = _squarify_layout(scaled, 0, 0, W, H)
 
-    fig, ax = plt.subplots(figsize=(6.8, 4.1), dpi=200)
+    fig, ax = plt.subplots(figsize=(11.5, 4.9), dpi=200)
     max_val = max(values) if values else 1
     legend_handles = None
 
@@ -730,46 +738,89 @@ def _render_treemap(
             # parent rectangle's own shape (squarify doesn't guarantee
             # perfect squares, just near-square).
             part_total = sum(p["value"] for p in breakdown) or 1
+            sub_boxes = []  # (cx, cy, sub_w, sub_h, sub_pct) per dataset, for labeling below
             if rw >= rh:
                 cx = rx
                 for p in breakdown:
                     sub_w = rw * (p["value"] / part_total)
+                    # A thin sliver's white edge (2pt on each side) can eat
+                    # a large share of its own already-small area — drop
+                    # the edge there so the true proportion isn't visually
+                    # eroded further. This doesn't make the sliver BIGGER
+                    # than its real share (that would misrepresent the
+                    # data) — it just stops shrinking it further with a
+                    # border it can't really afford.
+                    edge_width = 2 if sub_w > 15 else 0
                     ax.add_patch(
-                        plt.Rectangle((cx, ry), sub_w, rh, facecolor=p["color"], edgecolor=MPL_BG, linewidth=2)
+                        plt.Rectangle(
+                            (cx, ry), sub_w, rh, facecolor=p["color"], edgecolor=MPL_BG, linewidth=edge_width
+                        )
                     )
+                    sub_boxes.append((cx, ry, sub_w, rh, p["value"] / total * 100))
                     cx += sub_w
             else:
                 cy = ry
                 for p in breakdown:
                     sub_h = rh * (p["value"] / part_total)
+                    edge_width = 2 if sub_h > 15 else 0
                     ax.add_patch(
-                        plt.Rectangle((rx, cy), rw, sub_h, facecolor=p["color"], edgecolor=MPL_BG, linewidth=2)
+                        plt.Rectangle(
+                            (rx, cy), rw, sub_h, facecolor=p["color"], edgecolor=MPL_BG, linewidth=edge_width
+                        )
                     )
+                    sub_boxes.append((rx, cy, rw, sub_h, p["value"] / total * 100))
                     cy += sub_h
             if legend_handles is None:
                 legend_handles = [Patch(facecolor=p["color"], label=p["name"]) for p in breakdown]
-            text_color = "white"
+
+            # Short/wide rows (e.g. the smallest axes, squeezed into a
+            # thin band) don't have room for BOTH the top-positioned axis
+            # label and a separately-positioned sub-box percentage
+            # without the two colliding — fall back to a single centered
+            # label for the whole box, same as the single-dataset case
+            # below, and skip the per-sub-box percentages entirely there.
+            if rw > 35 and rh > 45:
+                ax.text(
+                    rx + rw / 2, ry + rh * 0.12, label, ha="center", va="top",
+                    fontsize=8, color="white", **_mpl_font("bold"),
+                )
+                # Each sub-box's own percentage, centered within ITS OWN
+                # area (below where the axis label sits) — this is what
+                # gives the smaller (often comparison-dataset) sub-box a
+                # visible number of its own, instead of just an unlabeled
+                # sliver of color.
+                for sub_x, sub_y, sub_w, sub_h, sub_pct in sub_boxes:
+                    if sub_w > 22 and sub_h > 20:
+                        ax.text(
+                            sub_x + sub_w / 2, sub_y + sub_h * 0.62, f"{sub_pct:.1f}%",
+                            ha="center", va="center", fontsize=7, color="white", **_mpl_font("regular"),
+                        )
+            elif rw > 35 and rh > 20:
+                ax.text(
+                    rx + rw / 2, ry + rh / 2, label, ha="center", va="center",
+                    fontsize=8, color="white", **_mpl_font("bold"),
+                )
         else:
             norm = value / max_val
             color = _lerp_hex(MPL_ACCENT_200, MPL_ACCENT_800, 0.15 + 0.85 * norm)
             ax.add_patch(plt.Rectangle((rx, ry), rw, rh, facecolor=color, edgecolor=MPL_BG, linewidth=2))
             text_color = "white" if norm > 0.45 else MPL_TEXT
 
-        if rw > 35 and rh > 20:
-            if rh > 32:
-                ax.text(
-                    rx + rw / 2, ry + rh / 2, label, ha="center", va="bottom",
-                    fontsize=8, color=text_color, **_mpl_font("bold"),
-                )
-                ax.text(
-                    rx + rw / 2, ry + rh / 2, f"({pct:.1f}%)", ha="center", va="top",
-                    fontsize=7, color=text_color, **_mpl_font("regular"),
-                )
-            else:
-                ax.text(
-                    rx + rw / 2, ry + rh / 2, label, ha="center", va="center",
-                    fontsize=8, color=text_color, **_mpl_font("bold"),
-                )
+            if rw > 35 and rh > 20:
+                if rh > 32:
+                    ax.text(
+                        rx + rw / 2, ry + rh / 2, label, ha="center", va="bottom",
+                        fontsize=8, color=text_color, **_mpl_font("bold"),
+                    )
+                    ax.text(
+                        rx + rw / 2, ry + rh / 2, f"({pct:.1f}%)", ha="center", va="top",
+                        fontsize=7, color=text_color, **_mpl_font("regular"),
+                    )
+                else:
+                    ax.text(
+                        rx + rw / 2, ry + rh / 2, label, ha="center", va="center",
+                        fontsize=8, color=text_color, **_mpl_font("bold"),
+                    )
     ax.set_xlim(0, W)
     ax.set_ylim(0, H)
     ax.invert_yaxis()
@@ -1037,22 +1088,42 @@ def _sample_thumbnail_row(
 ) -> Table | None:
     """
     A single row of small thumbnails with the filename underneath — used
-    for the Dataset composition 'samples' rows (low-fit / near-duplicate).
-    Each thumbnail is framed as a blueprint object, same as every other
-    figure in the report.
+    for the Dataset composition 'samples' rows (low-fit / near-duplicate /
+    cross-dataset match groups). Each thumbnail is framed as a blueprint
+    object, same as every other figure in the report.
 
     Fixed WIDTH per column, height computed from each image's own aspect
     ratio (never distorted/stretched to a square), top-aligned so images
     of different proportions all start flush at the top of the row.
+
+    When there are more than n_cols images, the LAST column becomes a
+    "N MORE..." placeholder instead of a 6th (or Nth) photo — showing
+    N-1 real thumbnails plus a count of how many more belong to this same
+    group, rather than silently truncating with no indication more exist.
     """
     thumb_w = (thumb_size or (doc_width / n_cols - 6)) - 14  # leave room for the frame
+    total = len(paths)
+    show_count = n_cols if total <= n_cols else n_cols - 1
+
     cells = []
-    for p in paths[:n_cols]:
+    for p in paths[:show_count]:
         buf = _thumbnail_bytes(p, max_size=300)
         if buf is None:
             continue
         framed = _Blueprint(_rl_image_for_width(buf, thumb_w), pad=3, margin=6)
         cells.append([framed, Paragraph(p.name, styles["caption"])])
+
+    if total > n_cols:
+        remaining = total - show_count
+        more_inner = Table([[Paragraph(f'<font size="13"><b>{remaining}</b></font><br/>'
+                                        f'<font size="8">MORE...</font>', styles["caption"])]],
+                            colWidths=[thumb_w], rowHeights=[thumb_w * 0.72])
+        more_inner.setStyle(
+            TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")])
+        )
+        framed_more = _Blueprint(more_inner, pad=3, margin=6)
+        cells.append([framed_more, ""])
+
     if not cells:
         return None
     while len(cells) < n_cols:
@@ -1083,6 +1154,8 @@ def generate_pdf_report(
     representative_images: list[tuple[str, Path]],
     low_fit_samples: list[Path] | None = None,
     duplicate_samples: list[Path] | None = None,
+    cross_dataset_match_count: int | None = None,
+    cross_dataset_groups: list[list[Path]] | None = None,
     radar_dominance_values: dict[str, float] | None = None,
     radar_normalized_values: dict[str, float] | None = None,
     radar_dominance_values_compare: dict[str, float] | None = None,
@@ -1172,6 +1245,13 @@ def generate_pdf_report(
             f"<b>{overview.visual_duplicates_count:,} images belong to near-duplicate "
             "groups.</b> This may be expected (e.g. burst-mode photos) or a sign of "
             "redundancy, depending on what this dataset is for."
+        )
+    if cross_dataset_match_count:
+        callout_lines.append(
+            f"<b>{cross_dataset_match_count:,} images appear in both datasets.</b> "
+            f"Same or near-identical photo present in \u201c{dataset_name}\u201d and "
+            f"\u201c{compare_dataset_name}\u201d \u2014 worth checking whether that's "
+            "expected overlap or accidental duplication between the two."
         )
     if clip_mmd is not None and clip_mmd_baseline is not None and compare_dataset_name:
         callout_lines.append(
@@ -1517,11 +1597,38 @@ def generate_pdf_report(
             story.append(row)
     story.append(Spacer(1, SP_4))
 
+    if cross_dataset_match_count:
+        story.append(
+            Paragraph(
+                f"Cross-dataset matches — {cross_dataset_match_count:,} images",
+                styles["section"],
+            )
+        )
+        story.append(Spacer(1, SP_2))
+        for i, group in enumerate(cross_dataset_groups or [], start=1):
+            story.append(
+                Paragraph(f"Match group {i} — {len(group):,} images", styles["caption"])
+            )
+            story.append(Spacer(1, SP_1))
+            row = _sample_thumbnail_row(portrait_w, group, styles)
+            if row:
+                story.append(row)
+            story.append(Spacer(1, SP_2))
+        story.append(Spacer(1, SP_2))
+
     # Treemap — deliberately a different chart TYPE from "Axis sizes"
-    # earlier in the report, so the two don't look like duplicates.
+    # earlier in the report, so the two don't look like duplicates. Its
+    # own landscape page (same pattern as the radar/scatter below) — the
+    # portrait width didn't leave enough room for each sub-box's own
+    # label when comparing two datasets.
     if overview.axis_sizes:
+        story.append(NextPageTemplate("Landscape"))
+        story.append(PageBreak())
         treemap_buf = _render_treemap(combined_axis_sizes, axis_sizes_breakdown if comparing else None)
-        story.append(_Blueprint(_rl_image_for_width(treemap_buf, portrait_w - 26), pad=6, margin=7))
+        treemap_frame = _Blueprint(_rl_image_for_width(treemap_buf, landscape_w - 26), pad=6, margin=7)
+        treemap_frame.wrap(landscape_w, landscape_h)
+        story.append(Spacer(1, max(0, (landscape_h - treemap_frame.height) / 2)))
+        story.append(treemap_frame)
 
     # --- Landscape: dual radar comparison -----------------------------
     if radar_dominance_values and radar_normalized_values:

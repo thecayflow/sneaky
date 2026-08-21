@@ -57,6 +57,8 @@ from src.similarity.phash import (
     DEFAULT_GROUP_THRESHOLD_BITS,
     build_grouped_chain,
     build_similarity_chain,
+    compute_cross_dataset_matches,
+    compute_global_order,
     get_duplicate_sample_paths,
     get_or_compute_duplicate_stats,
     get_or_compute_global_order,
@@ -1258,6 +1260,7 @@ if result is not None:
         result["path"],
         chain_method,
         group_threshold_bits if chain_method == "Grouped by cluster size" else None,
+        compare_result["path"] if compare_result is not None else None,
     )
 
     if st.session_state.get("similarity_chain_cache_key") != cache_key:
@@ -1271,11 +1274,33 @@ if result is not None:
         phashes = get_or_compute_phashes(
             result["path"], result["paths"], progress_callback=_update_phash_progress
         )
+
+        # When comparing, pool both datasets' images/hashes together so
+        # the SAME chain/order/grouping algorithms below naturally surface
+        # cross-dataset near-duplicates too, right alongside the
+        # within-dataset ones — not a separate 4th mode, just images from
+        # the comparison feed slotting into wherever they visually belong.
+        # dataset_name_by_path stays None for the single-dataset case,
+        # which keeps every caption exactly as it was before.
+        dataset_name_by_path: dict[str, str] | None = None
+        if compare_result is not None:
+            compare_phashes = get_or_compute_phashes(
+                compare_result["path"], compare_result["paths"], progress_callback=_update_phash_progress
+            )
+            chain_paths = list(result["paths"]) + list(compare_result["paths"])
+            chain_hashes = {**phashes, **compare_phashes}
+            dataset_name_by_path = {
+                **{str(p): result["dataset_name"] for p in result["paths"]},
+                **{str(p): compare_result["dataset_name"] for p in compare_result["paths"]},
+            }
+        else:
+            chain_paths = result["paths"]
+            chain_hashes = phashes
         phash_progress.empty()
 
         if chain_method == "Greedy chain":
             raw_chain = build_similarity_chain(
-                result["paths"], phashes, start_index=0, max_length=DEFAULT_CHAIN_MAX_LENGTH
+                chain_paths, chain_hashes, start_index=0, max_length=DEFAULT_CHAIN_MAX_LENGTH
             )
             chain = [(p, "start" if d is None else f"Δ {d}") for p, d in raw_chain]
         elif chain_method == "Global order":
@@ -1283,16 +1308,24 @@ if result is not None:
                 "Computing global visual order — this can take a while the first "
                 "time on large datasets, then it's cached for this dataset."
             ):
-                full_order = get_or_compute_global_order(
-                    result["path"], result["paths"], phashes
-                )
+                if compare_result is None:
+                    full_order = get_or_compute_global_order(result["path"], chain_paths, chain_hashes)
+                else:
+                    # Bypasses the disk-cache wrapper when comparing — same
+                    # reasoning as the UMAP/scatter projection: that cache
+                    # is keyed by the primary dataset's own path, and
+                    # writing a pooled-dataset result under that key risks
+                    # confusing a later single-dataset-only run. Session-
+                    # state memoization above (cache_key) still avoids
+                    # recomputing this on every unrelated rerun.
+                    full_order = compute_global_order(chain_paths, chain_hashes)
             raw_chain = full_order[:DEFAULT_CHAIN_MAX_LENGTH]
             chain = [(p, "start" if d is None else f"Δ {d}") for p, d in raw_chain]
         else:
             with st.spinner("Grouping near-duplicate clusters..."):
                 chain = build_grouped_chain(
-                    result["paths"],
-                    phashes,
+                    chain_paths,
+                    chain_hashes,
                     threshold_bits=group_threshold_bits,
                     max_length=DEFAULT_CHAIN_MAX_LENGTH,
                 )
@@ -1305,12 +1338,29 @@ if result is not None:
                 b64 = _image_to_base64_thumb(img_path)
                 if b64 is None:
                     continue
+                extra_line = ""
+                if dataset_name_by_path is not None:
+                    ds_name = dataset_name_by_path.get(str(img_path), "")
+                    # Same blue/amber convention as everywhere else a
+                    # second dataset is shown (PDF radar/scatter, the
+                    # Axes list) — kept as local literal hex values here
+                    # since app.py otherwise has no reason to import
+                    # pdf_report's matplotlib-oriented color constants.
+                    # Must stay in sync with MPL_ACCENT/MPL_ACCENT_COMPARE
+                    # in src/report/pdf_report.py if either ever changes.
+                    ds_color = "#5980A6" if ds_name == result["dataset_name"] else "#D97B29"
+                    extra_line = (
+                        f'<div style="font-size: 10px; color: {ds_color}; margin-top: 1px;">'
+                        f"{img_path.name}</div>"
+                        f'<div style="font-size: 10px; color: {ds_color};">{ds_name}</div>'
+                    )
                 items_html.append(
                     f'<div style="flex: 0 0 auto; text-align: center; margin-right: 8px;">'
                     f'<img src="data:image/jpeg;base64,{b64}" '
                     f'style="height: {SIMILARITY_CHAIN_THUMB_SIZE}px; border-radius: 4px; '
                     f'display: block;" title="{img_path.name}" />'
                     f'<div style="font-size: 11px; color: #888; margin-top: 2px;">{label}</div>'
+                    f"{extra_line}"
                     f"</div>"
                 )
             chain_html = (
@@ -1359,6 +1409,8 @@ if result is not None:
             # cards/bar chart broken down by dataset instead of only the
             # primary feed's own numbers.
             overview_compare = None
+            cross_dataset_match_count = None
+            cross_dataset_groups = None
             if compare_result is not None:
                 compare_report_phashes = get_or_compute_phashes(
                     compare_result["path"], compare_result["paths"]
@@ -1371,6 +1423,19 @@ if result is not None:
                     total_images=len(compare_result["paths"]),
                     duplicate_image_count=compare_duplicate_stats["n_duplicate_images"],
                 )
+
+                # Cross-dataset near-duplicates — reuses the pHashes already
+                # computed just above for each dataset's own stats, no new
+                # hashing pass needed. Every group is shown in the PDF (not
+                # just the biggest), largest first — same "biggest evidence
+                # first" convention as build_grouped_chain. Capping to a
+                # readable number of thumbnails PER group (not how many
+                # groups get shown) happens inside _sample_thumbnail_row.
+                cross_dataset_groups = compute_cross_dataset_matches(
+                    result["paths"], report_phashes, compare_result["paths"], compare_report_phashes
+                )
+                cross_dataset_groups.sort(key=len, reverse=True)
+                cross_dataset_match_count = sum(len(g) for g in cross_dataset_groups)
 
             representative_pairs = get_representative_images_by_axis(full_axes)
             # Custom axes have no centroid image of their own — fall back to
@@ -1488,6 +1553,8 @@ if result is not None:
                 representative_images=representative_pairs,
                 low_fit_samples=low_fit_samples,
                 duplicate_samples=duplicate_samples,
+                cross_dataset_match_count=cross_dataset_match_count,
+                cross_dataset_groups=cross_dataset_groups,
                 radar_dominance_values=radar_dominance_values,
                 radar_normalized_values=radar_normalized_values,
                 radar_dominance_values_compare=radar_dominance_values_compare,
