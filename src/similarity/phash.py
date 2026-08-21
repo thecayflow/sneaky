@@ -342,6 +342,27 @@ def get_duplicate_sample_paths(
     return [available[i] for i in largest_group[:n_samples]]
 
 
+def get_all_duplicate_groups(
+    paths: list[Path],
+    hashes: dict[str, imagehash.ImageHash],
+    threshold_bits: int = DEFAULT_GROUP_THRESHOLD_BITS,
+) -> list[list[Path]]:
+    """
+    EVERY near-duplicate group (2+ members) within this one dataset,
+    largest first — unlike get_duplicate_sample_paths, which only samples
+    from the single biggest group. Used for the "Near duplicates" PDF
+    section's flowing thumbnail grid, so a dataset with many small
+    duplicate clusters (not just one big one) gets ALL of them shown, not
+    just an example from the biggest.
+    """
+    available, groups = _compute_duplicate_groups(paths, hashes, threshold_bits)
+    multi_groups = [
+        [available[i] for i in members] for members in groups.values() if len(members) > 1
+    ]
+    multi_groups.sort(key=len, reverse=True)
+    return multi_groups
+
+
 def build_grouped_chain(
     paths: list[Path],
     hashes: dict[str, imagehash.ImageHash],

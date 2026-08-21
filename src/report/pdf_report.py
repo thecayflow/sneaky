@@ -1084,7 +1084,12 @@ def _thumbnail_bytes(path: Path, max_size: int = 400) -> io.BytesIO | None:
 
 
 def _sample_thumbnail_row(
-    doc_width: float, paths: list[Path], styles: dict, n_cols: int = 6, thumb_size: float = None
+    doc_width: float,
+    paths: list[Path],
+    styles: dict,
+    n_cols: int = 6,
+    thumb_size: float = None,
+    dataset_names: list[str] | None = None,
 ) -> Table | None:
     """
     A single row of small thumbnails with the filename underneath — used
@@ -1100,18 +1105,39 @@ def _sample_thumbnail_row(
     "N MORE..." placeholder instead of a 6th (or Nth) photo — showing
     N-1 real thumbnails plus a count of how many more belong to this same
     group, rather than silently truncating with no indication more exist.
+
+    dataset_names, if given: one entry per path (same order/length) —
+    colors each thumbnail's caption (filename + dataset name) by which
+    dataset it came from, steel-blue/amber in first-seen order, same
+    convention as everywhere else two datasets are distinguished. None
+    (the default) keeps the original plain gray filename-only caption.
     """
     thumb_w = (thumb_size or (doc_width / n_cols - 6)) - 14  # leave room for the frame
     total = len(paths)
     show_count = n_cols if total <= n_cols else n_cols - 1
 
+    dataset_color_map: dict[str, str] = {}
+    if dataset_names:
+        seen_names: list[str] = []
+        for name in dataset_names:
+            if name not in seen_names:
+                seen_names.append(name)
+        palette = [MPL_ACCENT, MPL_ACCENT_COMPARE]
+        dataset_color_map = {name: palette[i % len(palette)] for i, name in enumerate(seen_names)}
+
     cells = []
-    for p in paths[:show_count]:
+    for idx, p in enumerate(paths[:show_count]):
         buf = _thumbnail_bytes(p, max_size=300)
         if buf is None:
             continue
         framed = _Blueprint(_rl_image_for_width(buf, thumb_w), pad=3, margin=6)
-        cells.append([framed, Paragraph(p.name, styles["caption"])])
+        if dataset_names:
+            ds_name = dataset_names[idx]
+            color = dataset_color_map.get(ds_name, MPL_NEUTRAL_600)
+            caption = Paragraph(f'<font color="{color}">{p.name}<br/>{ds_name}</font>', styles["caption"])
+        else:
+            caption = Paragraph(p.name, styles["caption"])
+        cells.append([framed, caption])
 
     if total > n_cols:
         remaining = total - show_count
@@ -1148,14 +1174,128 @@ def _sample_thumbnail_row(
     return table
 
 
+def _flowing_thumbnail_grid(
+    doc_width: float,
+    groups: list[list[tuple[Path, str]]],
+    styles: dict,
+    n_cols: int = 6,
+    thumb_size: float = None,
+) -> list:
+    """
+    Packs images from MULTIPLE groups into a continuous flowing grid of
+    n_cols-wide rows — unlike one row per group (padded with blank cells
+    when a group doesn't fill a full row), a group's remaining images
+    continue filling the SAME row as the next group's, with no forced
+    row break at group boundaries. This is what avoids wasting paper when
+    there are many small groups (e.g. a large dataset with dozens of
+    near-duplicate pairs) — every row stays full until the very last one.
+
+    groups: list of groups, EACH a list of (Path, dataset_name) tuples —
+    already sorted largest-first by the caller (same convention as
+    before: biggest evidence shown first). A group with more than n_cols
+    images shows its first (n_cols - 1) thumbnails plus a single "N
+    MORE..." placeholder cell, same as the previous one-row-per-group
+    version. Each group's first cell gets a small "Group N" label
+    prepended to its caption, since row boundaries no longer align with
+    group boundaries, so groups still need SOME visual identification.
+
+    Returns a list of Flowables (one Table per row) — append them all to
+    the story, there's no wrapping frame around the whole grid.
+    """
+    thumb_w = (thumb_size or (doc_width / n_cols - 6)) - 14
+
+    # Color per unique dataset name (first-seen order across ALL groups,
+    # not per-row) — same steel-blue/amber convention as _sample_
+    # thumbnail_row, computed once so it's consistent across the whole
+    # grid regardless of which row a given dataset's image lands in.
+    all_names: list[str] = []
+    for group in groups:
+        for _p, name in group:
+            if name not in all_names:
+                all_names.append(name)
+    palette = [MPL_ACCENT, MPL_ACCENT_COMPARE]
+    dataset_color_map = {name: palette[i % len(palette)] for i, name in enumerate(all_names)}
+
+    # Flatten every group into one continuous sequence of cell
+    # descriptors — this flat sequence is what actually gets chunked
+    # into fixed-width rows below, irrespective of group boundaries.
+    cells_flat: list[dict] = []
+    for gi, group in enumerate(groups):
+        total = len(group)
+        show_count = n_cols if total <= n_cols else n_cols - 1
+        for idx, (path, ds_name) in enumerate(group[:show_count]):
+            cells_flat.append(
+                {
+                    "type": "image",
+                    "path": path,
+                    "dataset_name": ds_name,
+                    "group_label": f"Group {gi + 1}" if idx == 0 else None,
+                }
+            )
+        if total > n_cols:
+            cells_flat.append({"type": "more", "count": total - show_count})
+
+    rendered_cells = []
+    for cell in cells_flat:
+        if cell["type"] == "more":
+            more_inner = Table(
+                [[Paragraph(f'<font size="13"><b>{cell["count"]}</b></font><br/>'
+                            f'<font size="8">MORE...</font>', styles["caption"])]],
+                colWidths=[thumb_w], rowHeights=[thumb_w * 0.72],
+            )
+            more_inner.setStyle(
+                TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")])
+            )
+            rendered_cells.append((_Blueprint(more_inner, pad=3, margin=6), ""))
+            continue
+
+        buf = _thumbnail_bytes(cell["path"], max_size=300)
+        if buf is None:
+            continue
+        framed = _Blueprint(_rl_image_for_width(buf, thumb_w), pad=3, margin=6)
+        color = dataset_color_map.get(cell["dataset_name"], MPL_NEUTRAL_600)
+        caption_html = f'<font color="{color}">{cell["path"].name}<br/>{cell["dataset_name"]}</font>'
+        if cell["group_label"]:
+            caption_html = f'<font color="{MPL_NEUTRAL_600}"><b>{cell["group_label"]}</b></font><br/>' + caption_html
+        rendered_cells.append((framed, Paragraph(caption_html, styles["caption"])))
+
+    if not rendered_cells:
+        return []
+
+    row_flowables = []
+    for i in range(0, len(rendered_cells), n_cols):
+        row_cells = list(rendered_cells[i : i + n_cols])
+        while len(row_cells) < n_cols:
+            row_cells.append(("", ""))
+        table = Table(
+            [[c[0] for c in row_cells], [c[1] for c in row_cells]],
+            colWidths=[doc_width / n_cols] * n_cols,
+        )
+        table.setStyle(
+            TableStyle(
+                [
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("TOPPADDING", (0, 0), (-1, 0), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
+                    ("TOPPADDING", (0, 1), (-1, 1), 4),
+                    ("BOTTOMPADDING", (0, 1), (-1, 1), 4),
+                ]
+            )
+        )
+        row_flowables.append(table)
+    return row_flowables
+
+
 def generate_pdf_report(
     dataset_name: str,
     overview: DatasetOverviewMetrics,
     representative_images: list[tuple[str, Path]],
     low_fit_samples: list[Path] | None = None,
-    duplicate_samples: list[Path] | None = None,
+    low_fit_dataset_names: list[str] | None = None,
+    duplicate_groups: list[list[tuple[Path, str]]] | None = None,
     cross_dataset_match_count: int | None = None,
-    cross_dataset_groups: list[list[Path]] | None = None,
+    cross_dataset_groups: list[list[tuple[Path, str]]] | None = None,
     radar_dominance_values: dict[str, float] | None = None,
     radar_normalized_values: dict[str, float] | None = None,
     radar_dominance_values_compare: dict[str, float] | None = None,
@@ -1183,6 +1323,13 @@ def generate_pdf_report(
     landscape_w = LANDSCAPE_SIZE[0] - 2 * PAGE_MARGIN
     landscape_h = LANDSCAPE_SIZE[1] - 2 * PAGE_MARGIN
 
+    # Both dataset names when comparing, primary only otherwise — same
+    # "X vs Y" convention already used for the radar/scatter/treemap
+    # titles further down. Computed directly from the function's own
+    # parameters here since it's needed before `comparing` gets computed
+    # later (right before the "What should I look at?" callout).
+    report_title_names = f"{dataset_name} vs {compare_dataset_name}" if overview_compare is not None else dataset_name
+
     doc = BaseDocTemplate(
         buffer,
         pagesize=PORTRAIT_SIZE,
@@ -1190,7 +1337,7 @@ def generate_pdf_report(
         rightMargin=PAGE_MARGIN,
         topMargin=PAGE_MARGIN,
         bottomMargin=PAGE_MARGIN,
-        title=f"Semantic Report by sneaky\u2122 — {dataset_name}",
+        title=f"Semantic Report by sneaky\u2122 — {report_title_names}",
     )
     doc.addPageTemplates(
         [
@@ -1216,7 +1363,7 @@ def generate_pdf_report(
     # like a title block on a technical drawing. -------------------------
     story.append(Paragraph("SEMANTIC REPORT BY SNEAKY\u2122", styles["kicker"]))
     story.append(Spacer(1, SP_1))
-    story.append(Paragraph(dataset_name, styles["title"]))
+    story.append(Paragraph(report_title_names, styles["title"]))
     story.append(Spacer(1, SP_1))
     story.append(
         Paragraph(
@@ -1233,16 +1380,33 @@ def generate_pdf_report(
 
     # --- "What should I look at?" — the metric-to-evidence bridge, up
     # front, in plain language, before any chart or jargon. ---------------
+    # `comparing` and the combined counts are computed here (moved earlier
+    # than the KPI cards section below, which used to be the only place
+    # this existed) so the callout AND the "Low semantic fit"/"Near
+    # duplicates" section headers further down all agree with each other
+    # and with the KPI cards — previously only the KPI cards reflected
+    # both datasets; the callout and headers still only counted the
+    # primary feed, which could show e.g. "0 near duplicates" here even
+    # when the app's own duplicate view found matches living entirely in
+    # the comparison feed.
+    comparing = overview_compare is not None
+    combined_unclassified_count = overview.unclassified_count + (
+        overview_compare.unclassified_count if comparing else 0
+    )
+    combined_duplicate_count = overview.visual_duplicates_count + (
+        overview_compare.visual_duplicates_count if comparing else 0
+    )
+
     callout_lines = []
-    if overview.unclassified_count > 0:
+    if combined_unclassified_count > 0:
         callout_lines.append(
-            f"<b>{overview.unclassified_count:,} images have low semantic fit.</b> "
+            f"<b>{combined_unclassified_count:,} images have low semantic fit.</b> "
             "They don't strongly match any of the detected themes — worth a quick "
             "look to confirm they belong in this dataset."
         )
-    if overview.visual_duplicates_count > 0:
+    if combined_duplicate_count > 0:
         callout_lines.append(
-            f"<b>{overview.visual_duplicates_count:,} images belong to near-duplicate "
+            f"<b>{combined_duplicate_count:,} images belong to near-duplicate "
             "groups.</b> This may be expected (e.g. burst-mode photos) or a sign of "
             "redundancy, depending on what this dataset is for."
         )
@@ -1287,8 +1451,6 @@ def generate_pdf_report(
     # --- KPI cards ------------------------------------------------------
     story.append(_section_header("Overview", styles, portrait_w))
     story.append(Spacer(1, SP_4))
-
-    comparing = overview_compare is not None
 
     # Computed once here (not inline at each chart) so the bar chart AND
     # the treemap both use the exact same combined totals/breakdown —
@@ -1423,8 +1585,18 @@ def generate_pdf_report(
     )
     story.append(kpi_table)
     story.append(Spacer(1, SP_4))
+    # --- Axis size bar chart -----------------------------------------
+    if overview.axis_sizes or (overview_compare and overview_compare.axis_sizes):
+        if comparing:
+            bar_buf = _render_bar_chart(combined_axis_sizes, axis_sizes_breakdown)
+        else:
+            bar_buf = _render_bar_chart(overview.axis_sizes)
+        story.append(Spacer(1, SP_2))
+        story.append(_Blueprint(_rl_image_for_width(bar_buf, portrait_w - 26), pad=6, margin=7))
 
-    # --- Donut charts -----------------------------------------------
+    # --- Landscape: donut charts ---------------------------------------
+    story.append(NextPageTemplate("Landscape"))
+    story.append(PageBreak())
     if comparing:
         coverage_buf = _render_donut_with_breakdown(
             "Semantic coverage",
@@ -1464,7 +1636,7 @@ def generate_pdf_report(
         # A bit wider than the single-dataset case — the composite image
         # now stacks 3 pie charts (1 big + 2 mini), so the same width
         # would make the mini donuts uncomfortably small.
-        chart_w = portrait_w * 0.34
+        chart_w = landscape_w * 0.34
     else:
         coverage_buf = _render_donut(
             ["Classified", "Unclassified"],
@@ -1478,7 +1650,7 @@ def generate_pdf_report(
             [MPL_ACCENT, MPL_NEUTRAL_300],
             "Visual redundancy",
         )
-        chart_w = portrait_w * 0.30
+        chart_w = landscape_w * 0.30
     donut_table = Table(
         [
             [
@@ -1486,23 +1658,17 @@ def generate_pdf_report(
                 _Blueprint(_rl_image_for_width(duplicates_buf, chart_w), pad=4, margin=7),
             ]
         ],
-        colWidths=[portrait_w / 2, portrait_w / 2],
+        colWidths=[landscape_w / 2, landscape_w / 2],
     )
     donut_table.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER")]))
+    donut_table.wrap(landscape_w, landscape_h)
+    story.append(Spacer(1, max(0, (landscape_h - donut_table._height) / 2)))
     story.append(donut_table)
-
-    # --- Axis size bar chart -----------------------------------------
-    if overview.axis_sizes or (overview_compare and overview_compare.axis_sizes):
-        if comparing:
-            bar_buf = _render_bar_chart(combined_axis_sizes, axis_sizes_breakdown)
-        else:
-            bar_buf = _render_bar_chart(overview.axis_sizes)
-        story.append(Spacer(1, SP_2))
-        story.append(_Blueprint(_rl_image_for_width(bar_buf, portrait_w - 26), pad=6, margin=7))
 
     # --- Representative images ----------------------------------------
     if representative_images:
-        story.append(Spacer(1, SP_4))
+        story.append(NextPageTemplate("Portrait"))
+        story.append(PageBreak())
         story.append(_section_header("What's in this dataset", styles, portrait_w))
         story.append(Spacer(1, SP_3))
         story.append(
@@ -1571,30 +1737,28 @@ def generate_pdf_report(
 
     story.append(
         Paragraph(
-            f"Low semantic fit — {overview.unclassified_count:,} images "
-            f"({overview.unclassified_pct:.1f}%)",
+            f"Low semantic fit — {combined_unclassified_count:,} images "
+            f"({combined_unclassified_pct:.1f}%)",
             styles["section"],
         )
     )
     story.append(Spacer(1, SP_2))
     if low_fit_samples:
-        row = _sample_thumbnail_row(portrait_w, low_fit_samples, styles)
+        row = _sample_thumbnail_row(portrait_w, low_fit_samples, styles, dataset_names=low_fit_dataset_names)
         if row:
             story.append(row)
     story.append(Spacer(1, SP_4))
 
     story.append(
         Paragraph(
-            f"Near duplicates — {overview.visual_duplicates_count:,} images "
-            f"({overview.visual_duplicates_pct:.1f}%)",
+            f"Near duplicates — {combined_duplicate_count:,} images "
+            f"({combined_duplicates_pct:.1f}%)",
             styles["section"],
         )
     )
     story.append(Spacer(1, SP_2))
-    if duplicate_samples:
-        row = _sample_thumbnail_row(portrait_w, duplicate_samples, styles)
-        if row:
-            story.append(row)
+    for row in _flowing_thumbnail_grid(portrait_w, duplicate_groups or [], styles):
+        story.append(row)
     story.append(Spacer(1, SP_4))
 
     if cross_dataset_match_count:
@@ -1605,15 +1769,8 @@ def generate_pdf_report(
             )
         )
         story.append(Spacer(1, SP_2))
-        for i, group in enumerate(cross_dataset_groups or [], start=1):
-            story.append(
-                Paragraph(f"Match group {i} — {len(group):,} images", styles["caption"])
-            )
-            story.append(Spacer(1, SP_1))
-            row = _sample_thumbnail_row(portrait_w, group, styles)
-            if row:
-                story.append(row)
-            story.append(Spacer(1, SP_2))
+        for row in _flowing_thumbnail_grid(portrait_w, cross_dataset_groups or [], styles):
+            story.append(row)
         story.append(Spacer(1, SP_2))
 
     # Treemap — deliberately a different chart TYPE from "Axis sizes"

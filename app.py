@@ -43,6 +43,7 @@ from src.persistence import cache
 from src.pipeline import get_embeddings_only, run_pipeline
 from src.scoring.scoring import (
     OTHER_LABEL,
+    compute_score_matrix,
     get_axis_counts_by_dominance,
     get_dominant_labels,
     get_radar_values_by_dominance,
@@ -59,7 +60,7 @@ from src.similarity.phash import (
     build_similarity_chain,
     compute_cross_dataset_matches,
     compute_global_order,
-    get_duplicate_sample_paths,
+    get_all_duplicate_groups,
     get_or_compute_duplicate_stats,
     get_or_compute_global_order,
     get_or_compute_phashes,
@@ -296,6 +297,29 @@ def show_single_image_dialog(info: dict) -> None:
     )
 
 
+def _pooled_score_reference(result, compare_result, full_axes):
+    """
+    Raw (unstandardized) score matrix pooling BOTH datasets' images
+    against full_axes — the shared z-score reference so images from
+    either dataset are judged in the SAME frame when comparing. See
+    scoring.py::get_dominant_labels's standardize_reference docstring for
+    why each dataset standardizing against only its own scores is a real
+    bug (an axis with genuinely no matches in one dataset could still
+    "win" for an unrelated image there, since that axis's score
+    distribution is unusually tight/low within that one dataset alone).
+
+    None when there's no comparison feed loaded — every call site below
+    passes this straight through as standardize_reference, and None
+    there means "use the embeddings' own scores", exactly the prior,
+    single-dataset behavior.
+    """
+    if compare_result is None:
+        return None
+    primary_scores = compute_score_matrix(result["embeddings"], full_axes)
+    compare_scores = compute_score_matrix(compare_result["embeddings"], full_axes)
+    return np.concatenate([primary_scores, compare_scores], axis=0)
+
+
 def _score_and_pool_for_scatter(result, compare_result, full_axes, other_threshold):
     """
     Shared by the live Scatter view and the PDF's UMAP page: scores every
@@ -313,10 +337,11 @@ def _score_and_pool_for_scatter(result, compare_result, full_axes, other_thresho
     when there's no comparison feed loaded (single dataset).
     """
     axis_index_by_label = {axis.label: i + 1 for i, axis in enumerate(full_axes)}
+    standardize_reference = _pooled_score_reference(result, compare_result, full_axes)
 
     def _score_against_axes(embeddings_arr):
         dom_labels, score_mat, _ = get_dominant_labels(
-            embeddings_arr, full_axes, other_threshold=other_threshold
+            embeddings_arr, full_axes, other_threshold=other_threshold, standardize_reference=standardize_reference
         )
         clusters, sims = [], []
         for i, lbl in enumerate(dom_labels):
@@ -364,7 +389,15 @@ def _score_and_pool_for_scatter(result, compare_result, full_axes, other_thresho
     )
 
 
-def _copy_axis_images_to(label: str, dest_folder: str, embeddings, axes, paths, other_threshold: float) -> str:
+def _copy_axis_images_to(
+    label: str,
+    dest_folder: str,
+    embeddings,
+    axes,
+    paths,
+    other_threshold: float,
+    standardize_reference=None,
+) -> str:
     """
     Copies every image currently assigned to `label` into dest_folder
     (created automatically if needed), skipping any source image already
@@ -372,12 +405,19 @@ def _copy_axis_images_to(label: str, dest_folder: str, embeddings, axes, paths, 
     again for the same axis/destination combo is always safe and never
     duplicates a file.
 
+    standardize_reference: see scoring.py::get_dominant_labels — pass the
+    pooled score matrix of both datasets when comparing, so which images
+    count as belonging to `label` is consistent with what's shown
+    everywhere else (the axis list, View images, the radar/scatter).
+
     Returns the summary message; the caller displays it (kept separate so
     the caller can decide exactly when/how to show it).
     """
     dest_dir = Path(dest_folder)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    ranked = get_ranked_images_for_axis(embeddings, axes, paths, label, other_threshold)
+    ranked = get_ranked_images_for_axis(
+        embeddings, axes, paths, label, other_threshold, standardize_reference=standardize_reference
+    )
     source_paths = [p for p, _ in ranked]
 
     dest_key = str(dest_dir.resolve())
@@ -434,13 +474,151 @@ def _copy_axis_images_to_aggregated(
     calling it back-to-back for two different datasets is safe as-is; no
     changes needed there.
     """
+    standardize_reference = _pooled_score_reference(result, compare_result, full_axes)
     msg_primary = _copy_axis_images_to(
-        label, dest_folder, result["embeddings"], full_axes, result["paths"], other_threshold
+        label,
+        dest_folder,
+        result["embeddings"],
+        full_axes,
+        result["paths"],
+        other_threshold,
+        standardize_reference=standardize_reference,
     )
     msg_compare = _copy_axis_images_to(
-        label, dest_folder, compare_result["embeddings"], full_axes, compare_result["paths"], other_threshold
+        label,
+        dest_folder,
+        compare_result["embeddings"],
+        full_axes,
+        compare_result["paths"],
+        other_threshold,
+        standardize_reference=standardize_reference,
     )
     return f"{result['dataset_name']}: {msg_primary}\n{compare_result['dataset_name']}: {msg_compare}"
+
+
+def _render_axis_management_row(
+    label: str,
+    tag: str,
+    separated: bool,
+    axis_counts: dict,
+    compare_axis_counts: dict,
+    result,
+    compare_result,
+    full_axes,
+    other_threshold: float,
+    standardize_reference,
+    copy_destination: str,
+    on_remove,
+    key_suffix: str,
+    is_removable: bool = True,
+) -> None:
+    """
+    Renders one axis's row(s) in the Axes management UI — a single
+    combined row in Aggregated mode, or a bordered two-row block (🔵
+    primary dataset / 🟠 comparison dataset) in Separated mode. Shared by
+    BOTH the main "Axes" list (auto-detected axes + Other) and the
+    "Custom axes" section — previously the Custom axes section had its
+    own separate, older, comparison-unaware listing (plain "View images"
+    only, no dataset split, no Copy button), which also meant custom
+    axes appeared TWICE on the page: once correctly (with the dataset
+    split) in the main Axes list above, and once again — redundantly,
+    without the split — under "Custom axes" below.
+
+    on_remove: a zero-arg callable invoked when "Remove axis" is clicked
+    — different for auto-detected axes (add to excluded_axis_labels) vs.
+    custom axes (remove from custom_axis_labels), so this stays a
+    parameter rather than being hardcoded here.
+
+    key_suffix: makes widget keys unique between the two call sites
+    (e.g. "auto" vs "custom") even when the same label could in
+    principle appear in both (it can't today, but keeps this robust).
+    """
+    if not separated:
+        count = axis_counts.get(label, 0) + compare_axis_counts.get(label, 0)
+        c1, c2, c3, c4 = st.columns([2.4, 1.3, 1.6, 1])
+        c1.write(f"- **{label}**{tag} — {count} images")
+        c2.button(
+            "View images",
+            key=f"view_{key_suffix}_{label}",
+            on_click=_open_axis_dialog,
+            args=(label, "aggregated" if compare_result is not None else "primary"),
+        )
+        if c3.button("Copy images to...", key=f"copy_{key_suffix}_{label}"):
+            if not copy_destination:
+                st.error("Enter a destination folder below first.")
+            elif compare_result is not None:
+                message = _copy_axis_images_to_aggregated(
+                    label, copy_destination, result, compare_result, full_axes, other_threshold
+                )
+                st.toast(message, icon="✅")
+            else:
+                message = _copy_axis_images_to(
+                    label,
+                    copy_destination,
+                    result["embeddings"],
+                    full_axes,
+                    result["paths"],
+                    other_threshold,
+                    standardize_reference=standardize_reference,
+                )
+                st.toast(message, icon="✅")
+        if is_removable:
+            if c4.button("Remove axis", key=f"remove_{key_suffix}_{label}"):
+                on_remove()
+    else:
+        with st.container(border=True):
+            primary_count = axis_counts.get(label, 0)
+            c1, c2, c3, c4 = st.columns([2.4, 1.3, 1.6, 1])
+            c1.write(f"🔵 **{label}**{tag} — {primary_count} images ({result['dataset_name']})")
+            c2.button(
+                "View images",
+                key=f"view_{key_suffix}_{label}_primary",
+                on_click=_open_axis_dialog,
+                args=(label, "primary"),
+            )
+            if c3.button("Copy images to...", key=f"copy_{key_suffix}_{label}_primary"):
+                if not copy_destination:
+                    st.error("Enter a destination folder below first.")
+                else:
+                    message = _copy_axis_images_to(
+                        label,
+                        copy_destination,
+                        result["embeddings"],
+                        full_axes,
+                        result["paths"],
+                        other_threshold,
+                        standardize_reference=standardize_reference,
+                    )
+                    st.toast(message, icon="✅")
+            if is_removable:
+                if c4.button("Remove axis", key=f"remove_{key_suffix}_{label}_shared"):
+                    on_remove()
+
+            compare_count = compare_axis_counts.get(label, 0)
+            c1b, c2b, c3b, c4b = st.columns([2.4, 1.3, 1.6, 1])
+            c1b.write(f"🟠 **{label}**{tag} — {compare_count} images ({compare_result['dataset_name']})")
+            c2b.button(
+                "View images",
+                key=f"view_{key_suffix}_{label}_compare",
+                on_click=_open_axis_dialog,
+                args=(label, "comparison"),
+            )
+            if c3b.button("Copy images to...", key=f"copy_{key_suffix}_{label}_compare"):
+                if not copy_destination:
+                    st.error("Enter a destination folder below first.")
+                else:
+                    message = _copy_axis_images_to(
+                        label,
+                        copy_destination,
+                        compare_result["embeddings"],
+                        full_axes,
+                        compare_result["paths"],
+                        other_threshold,
+                        standardize_reference=standardize_reference,
+                    )
+                    st.toast(message, icon="✅")
+            # c4b intentionally left blank — Remove axis already shown
+            # once above, applies to both rows.
 
 
 @st.dialog("Axis images", width="large", dismissible=False)
@@ -452,6 +630,7 @@ def show_axis_images_dialog(
     other_threshold: float,
     extra_source: dict | None = None,
     primary_dataset_name: str | None = None,
+    standardize_reference=None,
 ) -> None:
     """
     extra_source / primary_dataset_name are only used by Aggregated-mode
@@ -466,6 +645,14 @@ def show_axis_images_dialog(
     as the primary, then its ranked images are appended after the
     primary's own (not interleaved by score — simplest predictable
     ordering: this dataset's images first, then the other's).
+
+    standardize_reference: see scoring.py::get_dominant_labels — pass the
+    pooled score matrix of both datasets whenever this dialog might show
+    the comparison feed's images (scope="comparison" or "aggregated"), so
+    which images end up assigned to `label` is consistent with everywhere
+    else (the axis list, Copy images, the radar/scatter) — without this,
+    an axis with genuinely no matches in one dataset could still "win"
+    for an unrelated image in that dataset alone.
     """
     # Close button rendered FIRST, unconditionally, before any other logic
     # — guarantees there's always a manual way to close this dialog, no
@@ -490,7 +677,9 @@ def show_axis_images_dialog(
         st.rerun(scope="app")
         return
 
-    ranked = get_ranked_images_for_axis(embeddings, axes, paths, label, other_threshold=other_threshold)
+    ranked = get_ranked_images_for_axis(
+        embeddings, axes, paths, label, other_threshold=other_threshold, standardize_reference=standardize_reference
+    )
     # (path, score, dataset name or None) — the dataset name stays None
     # for every entry in the single-dataset case (extra_source is None,
     # primary_dataset_name typically None too), which keeps captions
@@ -498,7 +687,12 @@ def show_axis_images_dialog(
     tagged = [(p, s, primary_dataset_name) for p, s in ranked]
     if extra_source is not None:
         compare_ranked = get_ranked_images_for_axis(
-            extra_source["embeddings"], axes, extra_source["paths"], label, other_threshold=other_threshold
+            extra_source["embeddings"],
+            axes,
+            extra_source["paths"],
+            label,
+            other_threshold=other_threshold,
+            standardize_reference=standardize_reference,
         )
         tagged += [(p, s, extra_source["dataset_name"]) for p, s in compare_ranked]
 
@@ -659,6 +853,15 @@ if result is not None:
     for i, label in enumerate(st.session_state.custom_axis_labels):
         full_axes.append(create_custom_axis(embedder, label, i))
 
+    compare_result = st.session_state.compare_result
+
+    # Computed ONCE here, reused by every scoring call below (axis counts,
+    # radar, scatter, View images, Copy images, PDF metrics) — see
+    # _pooled_score_reference's docstring for why each dataset judging
+    # itself against only its OWN score distribution is a real bug when
+    # comparing two datasets, not just a cosmetic inconsistency.
+    standardize_reference = _pooled_score_reference(result, compare_result, full_axes)
+
     # Recomputed every time against the FULL current axis set, so a new
     # custom axis can pull images away from whichever axis it now beats.
     other_threshold = st.slider(
@@ -677,10 +880,8 @@ if result is not None:
         ),
     )
     axis_counts = get_axis_counts_by_dominance(
-        result["embeddings"], full_axes, other_threshold=other_threshold
+        result["embeddings"], full_axes, other_threshold=other_threshold, standardize_reference=standardize_reference
     )
-
-    compare_result = st.session_state.compare_result
 
     radar_mode_options = ["Dominance (% of images)", "Normalized similarity"]
     if compare_result is not None:
@@ -713,7 +914,10 @@ if result is not None:
     )
     if radar_mode == "Dominance (% of images)":
         radar_values = get_radar_values_by_dominance(
-            result["embeddings"], full_axes, other_threshold=other_threshold
+            result["embeddings"],
+            full_axes,
+            other_threshold=other_threshold,
+            standardize_reference=standardize_reference,
         )
         value_label, value_format = "share of dataset", ".1%"
     elif radar_mode == "Normalized similarity":
@@ -736,11 +940,17 @@ if result is not None:
         # feed never gets its own clustering/labels, so both series are
         # directly comparable on the same radar.
         compare_axis_counts = get_axis_counts_by_dominance(
-            compare_result["embeddings"], full_axes, other_threshold=other_threshold
+            compare_result["embeddings"],
+            full_axes,
+            other_threshold=other_threshold,
+            standardize_reference=standardize_reference,
         )
         if radar_mode == "Dominance (% of images)":
             compare_values = get_radar_values_by_dominance(
-                compare_result["embeddings"], full_axes, other_threshold=other_threshold
+                compare_result["embeddings"],
+                full_axes,
+                other_threshold=other_threshold,
+                standardize_reference=standardize_reference,
             )
         elif radar_mode == "Normalized similarity":
             compare_values = get_radar_values_normalized(compare_result["embeddings"], full_axes)
@@ -812,6 +1022,7 @@ if result is not None:
                 full_axes,
                 compare_result["paths"],
                 other_threshold,
+                standardize_reference=standardize_reference,
             )
         elif scope == "aggregated" and compare_result is not None:
             show_axis_images_dialog(
@@ -826,6 +1037,7 @@ if result is not None:
                     "dataset_name": compare_result["dataset_name"],
                 },
                 primary_dataset_name=result["dataset_name"],
+                standardize_reference=standardize_reference,
             )
         else:
             show_axis_images_dialog(
@@ -834,6 +1046,7 @@ if result is not None:
                 full_axes,
                 result["paths"],
                 other_threshold,
+                standardize_reference=standardize_reference,
             )
 
     st.subheader("Axes")
@@ -855,7 +1068,10 @@ if result is not None:
     aggregation_mode = "Aggregated"
     if compare_result is not None:
         compare_axis_counts = get_axis_counts_by_dominance(
-            compare_result["embeddings"], full_axes, other_threshold=other_threshold
+            compare_result["embeddings"],
+            full_axes,
+            other_threshold=other_threshold,
+            standardize_reference=standardize_reference,
         )
         aggregation_mode = st.radio(
             "Datasets",
@@ -880,10 +1096,14 @@ if result is not None:
 
     # Sort by TOTAL count (both datasets combined when comparing, so the
     # row order doesn't jump around between Aggregated/Separated) — same
-    # descending-by-size convention as before.
+    # descending-by-size convention as before. Custom axes are excluded
+    # here — they get their own dedicated rendering under "Custom axes"
+    # below (with the same Aggregated/Separated-aware row logic), so they
+    # aren't shown twice.
     combined_counts_for_sort = {
         lbl: axis_counts.get(lbl, 0) + compare_axis_counts.get(lbl, 0)
         for lbl in set(axis_counts) | set(compare_axis_counts)
+        if lbl not in st.session_state.custom_axis_labels
     }
     sorted_labels = [lbl for lbl, _ in sorted(combined_counts_for_sort.items(), key=lambda item: -item[1])]
 
@@ -900,107 +1120,52 @@ if result is not None:
     aggregated_placeholder = st.empty()
     separated_placeholder = st.empty()
 
+    def _remove_auto_axis(lbl):
+        st.session_state.excluded_axis_labels.add(lbl)
+        st.rerun()
+
     if not separated:
         separated_placeholder.empty()
         with aggregated_placeholder.container():
             for label in sorted_labels:
-                if label == OTHER_LABEL:
-                    tag = " _(unclassified — no clear match)_"
-                elif label in st.session_state.custom_axis_labels:
-                    tag = " _(custom)_"
-                else:
-                    tag = ""
-                is_removable_auto_axis = (
-                    label != OTHER_LABEL and label not in st.session_state.custom_axis_labels
+                tag = " _(unclassified — no clear match)_" if label == OTHER_LABEL else ""
+                _render_axis_management_row(
+                    label,
+                    tag,
+                    separated=False,
+                    axis_counts=axis_counts,
+                    compare_axis_counts=compare_axis_counts,
+                    result=result,
+                    compare_result=compare_result,
+                    full_axes=full_axes,
+                    other_threshold=other_threshold,
+                    standardize_reference=standardize_reference,
+                    copy_destination=copy_destination,
+                    on_remove=lambda lbl=label: _remove_auto_axis(lbl),
+                    key_suffix="auto",
+                    is_removable=label != OTHER_LABEL,
                 )
-
-                count = axis_counts.get(label, 0) + compare_axis_counts.get(label, 0)
-                c1, c2, c3, c4 = st.columns([2.4, 1.3, 1.6, 1])
-                c1.write(f"- **{label}**{tag} — {count} images")
-                c2.button(
-                    "View images",
-                    key=f"view_{label}",
-                    on_click=_open_axis_dialog,
-                    args=(label, "aggregated" if compare_result is not None else "primary"),
-                )
-                if c3.button("Copy images to...", key=f"copy_{label}"):
-                    if not copy_destination:
-                        st.error("Enter a destination folder below first.")
-                    elif compare_result is not None:
-                        message = _copy_axis_images_to_aggregated(
-                            label, copy_destination, result, compare_result, full_axes, other_threshold
-                        )
-                        st.toast(message, icon="✅")
-                    else:
-                        message = _copy_axis_images_to(
-                            label, copy_destination, result["embeddings"], full_axes, result["paths"], other_threshold
-                        )
-                        st.toast(message, icon="✅")
-                if is_removable_auto_axis:
-                    if c4.button("Remove axis", key=f"remove_auto_{label}"):
-                        st.session_state.excluded_axis_labels.add(label)
-                        st.rerun()
     else:
         aggregated_placeholder.empty()
         with separated_placeholder.container():
             for label in sorted_labels:
-                if label == OTHER_LABEL:
-                    tag = " _(unclassified — no clear match)_"
-                elif label in st.session_state.custom_axis_labels:
-                    tag = " _(custom)_"
-                else:
-                    tag = ""
-                is_removable_auto_axis = (
-                    label != OTHER_LABEL and label not in st.session_state.custom_axis_labels
+                tag = " _(unclassified — no clear match)_" if label == OTHER_LABEL else ""
+                _render_axis_management_row(
+                    label,
+                    tag,
+                    separated=True,
+                    axis_counts=axis_counts,
+                    compare_axis_counts=compare_axis_counts,
+                    result=result,
+                    compare_result=compare_result,
+                    full_axes=full_axes,
+                    other_threshold=other_threshold,
+                    standardize_reference=standardize_reference,
+                    copy_destination=copy_destination,
+                    on_remove=lambda lbl=label: _remove_auto_axis(lbl),
+                    key_suffix="auto",
+                    is_removable=label != OTHER_LABEL,
                 )
-
-                with st.container(border=True):
-                    primary_count = axis_counts.get(label, 0)
-                    c1, c2, c3, c4 = st.columns([2.4, 1.3, 1.6, 1])
-                    c1.write(f"🔵 **{label}**{tag} — {primary_count} images ({result['dataset_name']})")
-                    c2.button(
-                        "View images",
-                        key=f"view_{label}_primary",
-                        on_click=_open_axis_dialog,
-                        args=(label, "primary"),
-                    )
-                    if c3.button("Copy images to...", key=f"copy_{label}_primary"):
-                        if not copy_destination:
-                            st.error("Enter a destination folder below first.")
-                        else:
-                            message = _copy_axis_images_to(
-                                label, copy_destination, result["embeddings"], full_axes, result["paths"], other_threshold
-                            )
-                            st.toast(message, icon="✅")
-                    if is_removable_auto_axis:
-                        if c4.button("Remove axis", key=f"remove_auto_{label}_shared"):
-                            st.session_state.excluded_axis_labels.add(label)
-                            st.rerun()
-
-                    compare_count = compare_axis_counts.get(label, 0)
-                    c1b, c2b, c3b, c4b = st.columns([2.4, 1.3, 1.6, 1])
-                    c1b.write(f"🟠 **{label}**{tag} — {compare_count} images ({compare_result['dataset_name']})")
-                    c2b.button(
-                        "View images",
-                        key=f"view_{label}_compare",
-                        on_click=_open_axis_dialog,
-                        args=(label, "comparison"),
-                    )
-                    if c3b.button("Copy images to...", key=f"copy_{label}_compare"):
-                        if not copy_destination:
-                            st.error("Enter a destination folder below first.")
-                        else:
-                            message = _copy_axis_images_to(
-                                label,
-                                copy_destination,
-                                compare_result["embeddings"],
-                                full_axes,
-                                compare_result["paths"],
-                                other_threshold,
-                            )
-                            st.toast(message, icon="✅")
-                    # c4b intentionally left blank — Remove axis already shown
-                    # once above, applies to both rows.
 
     st.text_input(
         "Copy destination folder",
@@ -1034,29 +1199,81 @@ if result is not None:
     new_axis = st.text_input("Add a custom axis", key="new_axis_input", placeholder="e.g. sky")
     if st.button("+ Add axis"):
         label = new_axis.strip()
+        label_lower = label.lower()
+        # Case-insensitive, and only checked against currently ACTIVE
+        # axes — an auto-detected axis you've already removed via "Remove
+        # axis" no longer blocks reusing its name here; once you've
+        # excluded it, its slot is free to reclaim as a custom axis. A
+        # custom axis behaves identically to an auto-detected one for
+        # scoring/image attribution either way (same get_dominant_labels
+        # competition), so there's no meaningful difference to protect
+        # against here beyond avoiding two simultaneously-active axes
+        # with the same name.
+        active_auto_labels = {
+            a.label.lower()
+            for a in result["base_axes"]
+            if a.label not in st.session_state.excluded_axis_labels
+        }
+        active_custom_labels = {lbl.lower() for lbl in st.session_state.custom_axis_labels}
         if not label:
             st.warning("Type a word or short phrase first.")
-        elif label in st.session_state.custom_axis_labels or any(
-            label == a.label for a in result["base_axes"]
-        ):
+        elif label_lower in active_custom_labels or label_lower in active_auto_labels:
             st.warning(f"'{label}' is already an active axis.")
         else:
             st.session_state.custom_axis_labels.append(label)
             st.rerun()
 
     if st.session_state.custom_axis_labels:
-        for label in list(st.session_state.custom_axis_labels):
-            c1, c2, c3 = st.columns([3, 1.3, 1])
-            c1.write(f"- {label}")
-            c2.button(
-                "View images",
-                key=f"view_custom_{label}",
-                on_click=_open_axis_dialog,
-                args=(label,),
-            )
-            if c3.button("Remove axis", key=f"remove_{label}"):
-                st.session_state.custom_axis_labels.remove(label)
-                st.rerun()
+
+        def _remove_custom_axis(lbl):
+            st.session_state.custom_axis_labels.remove(lbl)
+            st.rerun()
+
+        # Same Aggregated/Separated-aware rendering as the main Axes list
+        # above (see _render_axis_management_row) — and the same
+        # two-placeholder pattern to avoid the "ghost button" reconciliation
+        # issue on a mode switch, since this section is now mode-aware too.
+        custom_aggregated_placeholder = st.empty()
+        custom_separated_placeholder = st.empty()
+
+        if not separated:
+            custom_separated_placeholder.empty()
+            with custom_aggregated_placeholder.container():
+                for label in list(st.session_state.custom_axis_labels):
+                    _render_axis_management_row(
+                        label,
+                        "",
+                        separated=False,
+                        axis_counts=axis_counts,
+                        compare_axis_counts=compare_axis_counts,
+                        result=result,
+                        compare_result=compare_result,
+                        full_axes=full_axes,
+                        other_threshold=other_threshold,
+                        standardize_reference=standardize_reference,
+                        copy_destination=copy_destination,
+                        on_remove=lambda lbl=label: _remove_custom_axis(lbl),
+                        key_suffix="custom",
+                    )
+        else:
+            custom_aggregated_placeholder.empty()
+            with custom_separated_placeholder.container():
+                for label in list(st.session_state.custom_axis_labels):
+                    _render_axis_management_row(
+                        label,
+                        "",
+                        separated=True,
+                        axis_counts=axis_counts,
+                        compare_axis_counts=compare_axis_counts,
+                        result=result,
+                        compare_result=compare_result,
+                        full_axes=full_axes,
+                        other_threshold=other_threshold,
+                        standardize_reference=standardize_reference,
+                        copy_destination=copy_destination,
+                        on_remove=lambda lbl=label: _remove_custom_axis(lbl),
+                        key_suffix="custom",
+                    )
 
     st.subheader("Scatter view")
     st.caption(
@@ -1436,11 +1653,27 @@ if result is not None:
                 )
                 cross_dataset_groups.sort(key=len, reverse=True)
                 cross_dataset_match_count = sum(len(g) for g in cross_dataset_groups)
+                # Tag each image with which dataset it came from, so the
+                # PDF can color-code the caption (same convention as
+                # everywhere else two datasets are shown) — set membership
+                # check, since compute_cross_dataset_matches itself just
+                # returns plain mixed-origin Path lists.
+                primary_paths_set = {str(p) for p in result["paths"]}
+                cross_dataset_groups = [
+                    [
+                        (p, result["dataset_name"] if str(p) in primary_paths_set else compare_result["dataset_name"])
+                        for p in group
+                    ]
+                    for group in cross_dataset_groups
+                ]
 
             representative_pairs = get_representative_images_by_axis(full_axes)
             # Custom axes have no centroid image of their own — fall back to
             # a random image that actually dominates that axis, so every
             # axis (auto or custom) ends up represented in the report.
+            # Candidates are pooled from BOTH datasets when comparing (the
+            # representative could come from either one) — previously this
+            # only ever considered the primary feed.
             covered_labels = {label for label, _ in representative_pairs}
             for axis in full_axes:
                 if axis.label in covered_labels:
@@ -1451,7 +1684,17 @@ if result is not None:
                     result["paths"],
                     axis.label,
                     other_threshold=other_threshold,
+                    standardize_reference=standardize_reference,
                 )
+                if compare_result is not None:
+                    candidates = candidates + get_ranked_images_for_axis(
+                        compare_result["embeddings"],
+                        full_axes,
+                        compare_result["paths"],
+                        axis.label,
+                        other_threshold=other_threshold,
+                        standardize_reference=standardize_reference,
+                    )
                 if candidates:
                     random_path, _score = random.choice(candidates)
                     representative_pairs.append((axis.label, random_path))
@@ -1464,15 +1707,58 @@ if result is not None:
                     result["paths"],
                     OTHER_LABEL,
                     other_threshold=other_threshold,
-                )[:6]
+                    standardize_reference=standardize_reference,
+                )
             ]
-            duplicate_samples = get_duplicate_sample_paths(
-                result["paths"], report_phashes, threshold_bits=DEFAULT_GROUP_THRESHOLD_BITS
-            )
+            # ALL near-duplicate groups (not just a sample from the
+            # biggest one) — combined size-descending, primary's own
+            # groups first when tied, so the flowing thumbnail grid in
+            # the PDF packs the paper efficiently instead of one row per
+            # group with wasted blank cells.
+            duplicate_groups = [
+                [(p, result["dataset_name"]) for p in group]
+                for group in get_all_duplicate_groups(
+                    result["paths"], report_phashes, threshold_bits=DEFAULT_GROUP_THRESHOLD_BITS
+                )
+            ]
+            low_fit_dataset_names = [result["dataset_name"]] * len(low_fit_samples)
+
+            # Combined low-fit samples + near-duplicate groups from BOTH
+            # datasets when comparing — previously these (unlike the KPI
+            # cards, already fixed) only ever reflected the primary feed,
+            # which could show e.g. "0 near duplicates" in the PDF while
+            # the app's own duplicate view showed matches that turned out
+            # to live entirely in the comparison feed. The combined
+            # COUNTS for the callout/section headers are computed inside
+            # generate_pdf_report itself, from overview/overview_compare
+            # (same as it already does for the KPI cards) — no need to
+            # duplicate that here.
+            if compare_result is not None:
+                compare_low_fit = get_ranked_images_for_axis(
+                    compare_result["embeddings"],
+                    full_axes,
+                    compare_result["paths"],
+                    OTHER_LABEL,
+                    other_threshold=other_threshold,
+                    standardize_reference=standardize_reference,
+                )
+                low_fit_samples += [p for p, _score in compare_low_fit]
+                low_fit_dataset_names += [compare_result["dataset_name"]] * len(compare_low_fit)
+
+                duplicate_groups += [
+                    [(p, compare_result["dataset_name"]) for p in group]
+                    for group in get_all_duplicate_groups(
+                        compare_result["paths"], compare_report_phashes, threshold_bits=DEFAULT_GROUP_THRESHOLD_BITS
+                    )
+                ]
+            duplicate_groups.sort(key=len, reverse=True)
 
             # Both radar variants, over the same full_axes (auto + custom).
             radar_dominance_values = get_radar_values_by_dominance(
-                result["embeddings"], full_axes, other_threshold=other_threshold
+                result["embeddings"],
+                full_axes,
+                other_threshold=other_threshold,
+                standardize_reference=standardize_reference,
             )
             radar_dominance_values = {
                 label: v for label, v in radar_dominance_values.items() if label != OTHER_LABEL
@@ -1492,7 +1778,10 @@ if result is not None:
             radar_normalized_values_compare = None
             if compare_result is not None:
                 radar_dominance_values_compare = get_radar_values_by_dominance(
-                    compare_result["embeddings"], full_axes, other_threshold=other_threshold
+                    compare_result["embeddings"],
+                    full_axes,
+                    other_threshold=other_threshold,
+                    standardize_reference=standardize_reference,
                 )
                 radar_dominance_values_compare = {
                     label: v
@@ -1552,7 +1841,8 @@ if result is not None:
                 overview=overview,
                 representative_images=representative_pairs,
                 low_fit_samples=low_fit_samples,
-                duplicate_samples=duplicate_samples,
+                low_fit_dataset_names=low_fit_dataset_names,
+                duplicate_groups=duplicate_groups,
                 cross_dataset_match_count=cross_dataset_match_count,
                 cross_dataset_groups=cross_dataset_groups,
                 radar_dominance_values=radar_dominance_values,

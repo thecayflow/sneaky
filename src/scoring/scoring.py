@@ -97,10 +97,17 @@ def get_dominant_axis_per_image(score_matrix: np.ndarray, axes: list[AxisRecord]
     return [axes[i].label for i in dominant_indices]
 
 
-def _standardize_scores(score_matrix: np.ndarray) -> np.ndarray:
-    """Z-score each axis's column — see get_axis_counts_by_dominance for why."""
-    means = score_matrix.mean(axis=0, keepdims=True)
-    stds = score_matrix.std(axis=0, keepdims=True)
+def _standardize_scores(score_matrix: np.ndarray, reference_matrix: np.ndarray | None = None) -> np.ndarray:
+    """
+    Z-score each axis's column — see get_axis_counts_by_dominance for why.
+
+    reference_matrix, if given, supplies the mean/std to standardize
+    AGAINST, instead of score_matrix's own — see get_dominant_labels for
+    why a shared reference matters when comparing two datasets.
+    """
+    reference = reference_matrix if reference_matrix is not None else score_matrix
+    means = reference.mean(axis=0, keepdims=True)
+    stds = reference.std(axis=0, keepdims=True)
     stds[stds == 0] = 1.0  # guard against a degenerate axis with zero variance
     return (score_matrix - means) / stds
 
@@ -115,11 +122,33 @@ OTHER_LABEL = "Other"
 # this and always force-assign (the old behavior).
 DEFAULT_OTHER_THRESHOLD = -0.3
 
+# Minimum RAW cosine similarity a CUSTOM (text-derived) axis needs — in
+# addition to clearing other_threshold's z-score bar — to be allowed to
+# claim an image. Text-derived axes' raw similarity scores run in a much
+# narrower, lower range than image-derived ones (CLIP's well-documented
+# "modality gap" — see get_axis_counts_by_dominance), which can make
+# z-score standardization alone too sensitive on its own: a small
+# absolute difference between two genuinely UNRELATED images can still
+# swing a custom axis's z-score above other_threshold, even though
+# neither image is a real match for it (observed directly: a "Horse"
+# custom axis claiming 5 images at raw similarity 0.15-0.19, well below
+# where real horse photos score, simply because those 5 happened to be
+# the "least-bad" images for that axis within one dataset).
+#
+# A custom axis that wins the z-score competition but doesn't clear this
+# absolute floor gets DISQUALIFIED as a candidate for that one image —
+# the image then competes among the remaining (non-disqualified) axes
+# instead of being force-routed to OTHER_LABEL just because the
+# best-z-scoring option happened to be an under-qualified custom axis.
+# Auto-detected (image-derived) axes have no such floor.
+CUSTOM_AXIS_MIN_SIMILARITY = 0.20
+
 
 def get_dominant_labels(
     embeddings: np.ndarray,
     axes: list[AxisRecord],
     other_threshold: float | None = DEFAULT_OTHER_THRESHOLD,
+    standardize_reference: np.ndarray | None = None,
 ) -> tuple[list[str], np.ndarray, np.ndarray]:
     """
     For each image, the label of its best-matching axis — or OTHER_LABEL
@@ -127,22 +156,59 @@ def get_dominant_labels(
     meaning it doesn't clearly belong to any currently active axis rather
     than being forced into the least-bad one.
 
+    Custom (text-derived) axes — identified by axis.size == 0, the marker
+    create_custom_axis uses for "no real image cluster behind this axis"
+    — additionally need CUSTOM_AXIS_MIN_SIMILARITY of RAW similarity to
+    be eligible at all; one that wins the z-score competition without
+    clearing that floor is disqualified for that image, which then
+    competes among the remaining axes instead of going straight to
+    OTHER_LABEL. See CUSTOM_AXIS_MIN_SIMILARITY's own docstring for why.
+
+    standardize_reference: an optional raw score matrix (same axis
+    columns/order as `axes`, any number of rows) to compute the z-score
+    mean/std FROM, instead of `embeddings`' own scores. Pass the POOLED
+    score matrix of both datasets when comparing two feeds, so images
+    from either one get judged against the SAME reference frame. Without
+    this, each dataset standardizes against only its own scores — which
+    can make an axis with genuinely no matches in one dataset "win" for
+    an unrelated image anyway, simply because that axis's score
+    distribution is unusually tight/low within that one dataset alone
+    (low variance inflates z-scores for small real differences). None
+    (the default) standardizes against the passed-in embeddings' own
+    scores, exactly as before — the single-dataset case is unaffected.
+
     Returns (labels, score_matrix, standardized_matrix) — the two matrices
     are returned alongside so callers that also need raw similarity (e.g.
     ranking images within an axis) don't have to recompute them.
     """
     score_matrix = compute_score_matrix(embeddings, axes)
-    standardized = _standardize_scores(score_matrix)
-
-    dominant_indices = standardized.argmax(axis=1)
-    best_scores = standardized.max(axis=1)
+    standardized = _standardize_scores(score_matrix, standardize_reference)
+    is_custom_axis = np.array([axis.size == 0 for axis in axes])
 
     labels = []
-    for i, axis_idx in enumerate(dominant_indices):
-        if other_threshold is not None and best_scores[i] < other_threshold:
+    n_images = standardized.shape[0]
+    for i in range(n_images):
+        # Candidates ranked by z-score, best first — walk down the list,
+        # skipping any custom axis that doesn't clear the absolute floor,
+        # until we find one that's actually eligible.
+        order = np.argsort(-standardized[i])
+        chosen_idx = None
+        for axis_idx in order:
+            if is_custom_axis[axis_idx] and score_matrix[i, axis_idx] < CUSTOM_AXIS_MIN_SIMILARITY:
+                continue
+            chosen_idx = axis_idx
+            break
+        if chosen_idx is None:
+            # Every candidate was disqualified (only possible if every
+            # active axis is custom and none clear the floor) — fall back
+            # to the best z-score outright rather than leaving the image
+            # unlabeled.
+            chosen_idx = order[0]
+
+        if other_threshold is not None and standardized[i, chosen_idx] < other_threshold:
             labels.append(OTHER_LABEL)
         else:
-            labels.append(axes[axis_idx].label)
+            labels.append(axes[chosen_idx].label)
 
     return labels, score_matrix, standardized
 
@@ -151,6 +217,7 @@ def get_axis_counts_by_dominance(
     embeddings: np.ndarray,
     axes: list[AxisRecord],
     other_threshold: float | None = DEFAULT_OTHER_THRESHOLD,
+    standardize_reference: np.ndarray | None = None,
 ) -> dict[str, int]:
     """
     Recompute "how many images belong to each axis" by dominant similarity
@@ -169,6 +236,10 @@ def get_axis_counts_by_dominance(
     score for axis A" (z-score) instead of the raw magnitude puts axes of
     both kinds on a fair footing.
 
+    standardize_reference: see get_dominant_labels — pass the pooled score
+    matrix of both datasets when comparing, so counts for either dataset
+    are computed in the same reference frame.
+
     This is what makes custom axes behave correctly: adding a new axis
     like "sky" can pull images away from whichever existing axis they used
     to dominate, without ever rebuilding the hierarchical tree — the tree
@@ -177,7 +248,9 @@ def get_axis_counts_by_dominance(
     """
     from collections import Counter
 
-    labels, _, _ = get_dominant_labels(embeddings, axes, other_threshold=other_threshold)
+    labels, _, _ = get_dominant_labels(
+        embeddings, axes, other_threshold=other_threshold, standardize_reference=standardize_reference
+    )
     counts = Counter(labels)
 
     result = {axis.label: counts.get(axis.label, 0) for axis in axes}
@@ -192,6 +265,7 @@ def get_ranked_images_for_axis(
     paths: list[Path],
     axis_label: str,
     other_threshold: float | None = DEFAULT_OTHER_THRESHOLD,
+    standardize_reference: np.ndarray | None = None,
 ) -> list[tuple[Path, float]]:
     """
     Images assigned to `axis_label` (same rule as get_axis_counts_by_dominance,
@@ -202,18 +276,42 @@ def get_ranked_images_for_axis(
     images are ordered by their best (standardized) score ascending — the
     ones that fit LEAST well anywhere come first, since those are the
     clearest outliers.
+
+    standardize_reference: see get_dominant_labels — pass the pooled score
+    matrix of both datasets when comparing, so ranking/assignment for
+    either dataset is computed in the same reference frame.
     """
     labels, score_matrix, standardized = get_dominant_labels(
-        embeddings, axes, other_threshold=other_threshold
+        embeddings, axes, other_threshold=other_threshold, standardize_reference=standardize_reference
     )
     matches = np.array([i for i, lbl in enumerate(labels) if lbl == axis_label])
     if len(matches) == 0:
         return []
 
     if axis_label == OTHER_LABEL:
-        best_scores = standardized.max(axis=1)[matches]
-        order = np.argsort(best_scores)  # ascending: least-fitting first
-        return [(paths[matches[i]], float(best_scores[i])) for i in order]
+        # Re-walk the same disqualification logic get_dominant_labels used
+        # (rather than a plain standardized.max()) — otherwise an image's
+        # "best score" shown here could be a DISQUALIFIED custom axis's
+        # higher-but-invalid z-score, inconsistent with why it actually
+        # ended up in Other. Duplicated locally (not returned from
+        # get_dominant_labels itself) to avoid changing that function's
+        # return signature for every other caller.
+        is_custom_axis = np.array([axis.size == 0 for axis in axes])
+        chosen_scores = []
+        for i in matches:
+            order = np.argsort(-standardized[i])
+            chosen_idx = None
+            for axis_idx in order:
+                if is_custom_axis[axis_idx] and score_matrix[i, axis_idx] < CUSTOM_AXIS_MIN_SIMILARITY:
+                    continue
+                chosen_idx = axis_idx
+                break
+            if chosen_idx is None:
+                chosen_idx = order[0]
+            chosen_scores.append(standardized[i, chosen_idx])
+        chosen_scores = np.array(chosen_scores)
+        order = np.argsort(chosen_scores)  # ascending: least-fitting first
+        return [(paths[matches[i]], float(chosen_scores[i])) for i in order]
 
     axis_index = next(i for i, a in enumerate(axes) if a.label == axis_label)
     raw_scores = score_matrix[matches, axis_index]
@@ -225,12 +323,17 @@ def get_radar_values_by_dominance(
     embeddings: np.ndarray,
     axes: list[AxisRecord],
     other_threshold: float | None = DEFAULT_OTHER_THRESHOLD,
+    standardize_reference: np.ndarray | None = None,
 ) -> dict[str, float]:
     """
     Axis label -> fraction of the dataset for which this axis is the
     dominant match (see get_axis_counts_by_dominance). May include
     OTHER_LABEL — exclude it before plotting on the radar, since it has no
     real centroid/direction; it belongs in the axis list, not the chart.
+
+    standardize_reference: see get_dominant_labels — pass the pooled score
+    matrix of both datasets when comparing, so the radar's dominance
+    fractions for either dataset are computed in the same reference frame.
 
     This is what the radar actually plots: the raw mean-similarity value
     (get_radar_values) and the "images: N" dominance count measure
@@ -240,7 +343,9 @@ def get_radar_values_by_dominance(
     Plotting the dominance fraction instead keeps the chart consistent
     with the image counts shown alongside it.
     """
-    counts = get_axis_counts_by_dominance(embeddings, axes, other_threshold=other_threshold)
+    counts = get_axis_counts_by_dominance(
+        embeddings, axes, other_threshold=other_threshold, standardize_reference=standardize_reference
+    )
     total = len(embeddings)
     if total == 0:
         return {label: 0.0 for label in counts}

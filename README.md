@@ -21,7 +21,7 @@ See an example report: [docs/Sneaky_Sample_Report.pdf](docs/Sneaky_Sample_Report
 
 ## Try it now
 
-Two sample datasets with 680 AI-generated JPEG images are included in
+Two sample datasets with 700 AI-generated JPEG images are included in
 this repository:
 
 ```
