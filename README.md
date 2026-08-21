@@ -126,3 +126,12 @@ click.
 Sneaky is currently in beta.
 
 Feedback is welcome.
+
+## License
+
+Sneaky is source-available for evaluation and non-commercial use.
+
+Commercial use, redistribution, derivative works, and integration into
+other products or services require prior written permission.
+
+See [LICENSE](LICENSE) for details.
