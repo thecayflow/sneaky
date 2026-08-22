@@ -1,10 +1,10 @@
 ![sneaky icon](docs/icon.png)
 
-# sneaky™
+# sneakyReport™
 
 ## Visual Dataset Intelligence
 
-Sneaky analyzes image datasets and turns them into a visual dataset
+sneakyReport™ analyzes image datasets and turns them into a visual dataset
 intelligence report.
 
 It helps answer:
@@ -15,7 +15,7 @@ It helps answer:
 - How much visual redundancy is there?
 - How does it compare with another dataset?
 
-See an example report: [docs/Sneaky_Sample_Report.pdf](docs/Sneaky_Sample_Report.pdf)
+See an example report: [docs/sneakyReport_sample_document.pdf](docs/sneakyReport_sample_document.pdf)
 
 ---
 
@@ -30,8 +30,8 @@ dataset_samples/
 └── sample_02
 ```
 
-You can run Sneaky against them immediately after installation — no need
-to prepare your own dataset first.
+You can run sneakyReport™ against them immediately after installation — no
+need to prepare your own dataset first.
 
 ---
 
@@ -42,7 +42,7 @@ to prepare your own dataset first.
 - Recent NVIDIA drivers
 - Python 3.11
 
-Sneaky runs locally. Your images are not uploaded anywhere.
+sneakyReport™ runs locally. Your images are not uploaded anywhere.
 
 ---
 
@@ -51,10 +51,10 @@ Sneaky runs locally. Your images are not uploaded anywhere.
 Clone the repository:
 
 ```
-git clone https://github.com/thecayflow/sneaky.git
+git clone https://github.com/thecayflow/sneakyreport.git
 ```
 
-Open the `sneaky` folder and run:
+Open the `sneakyreport` folder and run:
 
 ```
 install.bat
@@ -65,7 +65,7 @@ dependencies.
 
 ---
 
-## Run Sneaky
+## Run sneakyReport™
 
 Double-click:
 
@@ -73,7 +73,7 @@ Double-click:
 run.bat
 ```
 
-Sneaky will open in your browser.
+sneakyReport™ will open in your browser.
 
 ---
 
@@ -89,10 +89,10 @@ Sneaky will open in your browser.
 
 ---
 
-## What Sneaky produces
+## What sneakyReport™ produces
 
 ### Semantic composition
-A radar chart of the semantic themes Sneaky finds in your dataset —
+A radar chart of the semantic themes sneakyReport™ finds in your dataset —
 detected automatically, or defined by you as custom text axes — showing
 how the images are distributed across them.
 
@@ -123,13 +123,13 @@ click.
 
 ## Status
 
-Sneaky is currently in beta.
+sneakyReport™ is currently in beta.
 
 Feedback is welcome.
 
 ## License
 
-Sneaky is source-available for evaluation and non-commercial use.
+sneakyReport™ is source-available for evaluation and non-commercial use.
 
 Commercial use, redistribution, derivative works, and integration into
 other products or services require prior written permission.
