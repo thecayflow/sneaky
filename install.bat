@@ -10,7 +10,7 @@ REM --- Check Python is available -----------------------------------------
 where python >nul 2>nul
 if errorlevel 1 (
     echo [ERROR] Python was not found on your PATH.
-    echo Please install Python 3.11+ from https://www.python.org/downloads/
+    echo Please install Python 3.11 from https://www.python.org/downloads/
     echo and make sure to check "Add python.exe to PATH" during setup.
     echo Then run this installer again.
     echo Press any key to continue...
@@ -76,6 +76,12 @@ REM --- Download the spaCy language model ----------------------------------
 echo Downloading the spaCy language model...
 echo.
 python -m spacy download en_core_web_sm
+if errorlevel 1 (
+    echo [ERROR] spaCy language model download failed. See the messages above.
+    echo Press any key to continue...
+    pause >nul
+    exit /b 1
+)
 echo.
 
 REM --- Final check: verify everything actually loads ----------------------
@@ -84,10 +90,16 @@ echo   Running installation check...
 echo ============================================
 echo.
 python check_install.py
+if errorlevel 1 (
+    echo [ERROR] Installation check failed - see the messages above.
+    echo Press any key to continue...
+    pause >nul
+    exit /b 1
+)
 
 echo.
 echo ============================================
-echo   Setup finished - use run.bat to start the app.
+echo   Setup verified - use run.bat to start the app.
 echo ============================================
 echo Press any key to continue...
 pause >nul

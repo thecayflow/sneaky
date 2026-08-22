@@ -60,10 +60,12 @@ def _check_spacy_model() -> bool:
         return False
 
 
-def main() -> None:
+def main() -> int:
     print("Checking sneaky installation...\n")
 
-    results = [
+    # Critical: any of these failing means the app genuinely can't run —
+    # these decide the exit code that install.bat checks.
+    critical_results = [
         _check("PyTorch", "torch"),
         _check("OpenCLIP", "open_clip"),
         _check("Transformers", "transformers"),
@@ -72,19 +74,34 @@ def main() -> None:
         _check("UMAP", "umap"),
         _check("ReportLab", "reportlab"),
         _check("Matplotlib", "matplotlib"),
-        _check_cuda(),
-        _check_spacy_model(),
     ]
 
+    # Informative, not critical: no CUDA-capable GPU means the app still
+    # runs — just slowly (see README) — so this is shown to the user but
+    # deliberately left OUT of the pass/fail exit code below. A missing
+    # GPU shouldn't halt an otherwise-successful install.bat run. Printed
+    # in the same position as before (right after the library checks,
+    # before the spaCy model check), just tracked separately from here on.
+    has_cuda = _check_cuda()
+
+    critical_results.append(_check_spacy_model())
+
     print()
-    if all(results):
+    if all(critical_results):
         print("sneaky installation successful!")
-    else:
-        print(
-            "Some checks failed — see above. The app may still partly work, "
-            "but re-run install.bat or check README.md if something looks wrong."
-        )
+        if not has_cuda:
+            print(
+                "Note: no CUDA-capable GPU was detected — the app will still run, "
+                "but noticeably slower (not tested on CPU-only setups)."
+            )
+        return 0
+
+    print(
+        "Some checks failed — see above. The app may still partly work, "
+        "but re-run install.bat or check README.md if something looks wrong."
+    )
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -32,3 +32,4 @@ ImageHash
 reportlab
 matplotlib
 PyWavelets
+tqdm
