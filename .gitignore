@@ -28,3 +28,6 @@ Thumbs.db
 # en el propio proyecto en vez de en Descargas) ---------------------------
 *.pdf
 !docs/**/*.pdf
+
+# --- Documentación interna (no destinada al repo público) -----------------
+BACKLOG.md
