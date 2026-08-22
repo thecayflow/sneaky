@@ -38,7 +38,7 @@ def _check_cuda() -> bool:
             return True
         print(
             f"  {'CUDA / NVIDIA GPU':.<{LABEL_WIDTH}} FAIL  "
-            "(no CUDA-capable GPU detected — the app will run, but very slowly)"
+            "(no CUDA-capable GPU detected -- the app will run, but very slowly)"
         )
         return False
     except Exception as exc:  # noqa: BLE001
@@ -65,16 +65,33 @@ def main() -> int:
     print("Checking sneakyReport(TM) installation...\n")
 
     # Critical: any of these failing means the app genuinely can't run —
-    # these decide the exit code that install.bat checks.
+    # these decide the exit code that install.bat checks. Kept in sync
+    # with requirements.txt by hand (no automated cross-check yet) — this
+    # list previously covered only 8 of the 18 real dependencies, which
+    # is exactly how a missing pillow-heif went undetected through a full
+    # "successful" install. Import name differs from the pip package name
+    # for several of these (noted inline) — that mismatch is the most
+    # common reason a package silently drops off this list over time.
     critical_results = [
         _check("PyTorch", "torch"),
-        _check("OpenCLIP", "open_clip"),
+        _check("OpenCLIP", "open_clip"),  # pip: open_clip_torch
         _check("Transformers", "transformers"),
-        _check("spaCy", "spacy"),
+        _check("Accelerate", "accelerate"),
         _check("Streamlit", "streamlit"),
-        _check("UMAP", "umap"),
+        _check("Plotly", "plotly"),
+        _check("scikit-learn", "sklearn"),  # pip: scikit-learn
+        _check("SciPy", "scipy"),
+        _check("NumPy", "numpy"),
+        _check("Pandas", "pandas"),
+        _check("Pillow", "PIL"),  # pip: pillow
+        _check("pillow-heif", "pillow_heif"),
+        _check("spaCy", "spacy"),
+        _check("UMAP", "umap"),  # pip: umap-learn
+        _check("ImageHash", "imagehash"),
         _check("ReportLab", "reportlab"),
         _check("Matplotlib", "matplotlib"),
+        _check("PyWavelets", "pywt"),
+        _check("tqdm", "tqdm"),
     ]
 
     # Informative, not critical: no CUDA-capable GPU means the app still
@@ -92,13 +109,13 @@ def main() -> int:
         print("sneakyReport(TM) installation successful!")
         if not has_cuda:
             print(
-                "Note: no CUDA-capable GPU was detected — the app will still run, "
+                "Note: no CUDA-capable GPU was detected -- the app will still run, "
                 "but noticeably slower (not tested on CPU-only setups)."
             )
         return 0
 
     print(
-        "Some checks failed — see above. The app may still partly work, "
+        "Some checks failed -- see above. The app may still partly work, "
         "but re-run install.bat or check README.md if something looks wrong."
     )
     return 1

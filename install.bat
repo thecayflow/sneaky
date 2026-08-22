@@ -2,7 +2,7 @@
 setlocal
 
 echo ============================================
-echo   sneakyReport (TM) — Visual Dataset Intelligence - Installer
+echo   sneakyReport (TM) -- Visual Dataset Intelligence - Installer
 echo ============================================
 echo.
 

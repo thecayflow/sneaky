@@ -17,7 +17,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Starting sneakyReport (TM) — Visual Dataset Intelligence...
+echo Starting sneakyReport (TM) -- Visual Dataset Intelligence...
 echo (The first launch can take 1-2 minutes - that's normal.)
 echo.
 

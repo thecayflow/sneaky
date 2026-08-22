@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ============================================
-echo   sneakyReport (TM) — Visual Dataset Intelligence - Uninstaller
+echo   sneakyReport (TM) -- Visual Dataset Intelligence - Uninstaller
 echo ============================================
 echo.
 echo Before continuing, make sure the app is NOT currently running
