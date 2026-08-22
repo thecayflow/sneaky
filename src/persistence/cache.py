@@ -460,3 +460,137 @@ def get_cache_info(root_path: str | Path) -> list[tuple[str, int]]:
         ((f.name, f.stat().st_size) for f in cache_dir.iterdir() if f.is_file()),
         key=lambda item: item[0],
     )
+
+
+# ---------------------------------------------------------------------------
+# Combined-axes cache (two datasets analyzed together) — a separate
+# location from the single-dataset one above, keyed by the PAIR of root
+# paths (order-independent: comparing A vs B hits the same cache entry as
+# B vs A). Used when a comparison feed is loaded: rather than only
+# scoring the second dataset against the primary's own axes, the axes
+# themselves get re-clustered over BOTH datasets' pooled embeddings, so a
+# theme present only in the second dataset (e.g. many horses when the
+# primary has none at all) can still surface as its own axis.
+# ---------------------------------------------------------------------------
+
+def _pair_cache_dir(root_path_a: str | Path, root_path_b: str | Path) -> Path:
+    resolved_a = str(Path(root_path_a).resolve())
+    resolved_b = str(Path(root_path_b).resolve())
+    # sorted() makes this order-independent — comparing A-vs-B and B-vs-A
+    # resolve to the exact same cache directory.
+    combined_key = "||".join(sorted([resolved_a, resolved_b]))
+    pair_hash = hashlib.sha256(combined_key.encode("utf-8")).hexdigest()[:16]
+    cache_dir = CACHE_ROOT / "pairs" / pair_hash
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def save_pair_combined_paths(
+    root_path_a: str | Path, root_path_b: str | Path, paths: list[Path]
+) -> None:
+    """
+    The exact combined path list (dataset A's paths, then dataset B's)
+    the pair's cached tree/axes were computed from — compared against a
+    freshly-recomputed combined path list on each run_combined_pipeline
+    call to detect whether EITHER dataset changed since, mirroring the
+    single-dataset invalidation pattern (added/removed/modified images)
+    but at the pair level.
+    """
+    cache_dir = _pair_cache_dir(root_path_a, root_path_b)
+    (cache_dir / "combined_paths.json").write_text(
+        json.dumps([str(p) for p in paths], ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def load_pair_combined_paths(root_path_a: str | Path, root_path_b: str | Path) -> list[Path] | None:
+    cache_dir = _pair_cache_dir(root_path_a, root_path_b)
+    paths_file = cache_dir / "combined_paths.json"
+    if not paths_file.exists():
+        return None
+    return [Path(p) for p in json.loads(paths_file.read_text(encoding="utf-8"))]
+
+
+def save_pair_tree(
+    root_path_a: str | Path, root_path_b: str | Path, Z: np.ndarray, linkage_method: str = "ward"
+) -> None:
+    cache_dir = _pair_cache_dir(root_path_a, root_path_b)
+    np.savez_compressed(cache_dir / f"tree_{linkage_method}.npz", Z=Z)
+    logger.info("Cached combined hierarchical tree (%s) for pair (%s, %s)", linkage_method, root_path_a, root_path_b)
+
+
+def load_pair_tree(
+    root_path_a: str | Path, root_path_b: str | Path, linkage_method: str = "ward"
+) -> np.ndarray | None:
+    cache_dir = _pair_cache_dir(root_path_a, root_path_b)
+    tree_file = cache_dir / f"tree_{linkage_method}.npz"
+    if not tree_file.exists():
+        return None
+    return np.load(tree_file)["Z"]
+
+
+def save_pair_axes(
+    root_path_a: str | Path,
+    root_path_b: str | Path,
+    k: int,
+    records: list[AxisRecord],
+    linkage_method: str = "ward",
+) -> None:
+    cache_dir = _pair_cache_dir(root_path_a, root_path_b)
+    axes_file = cache_dir / f"axes_{linkage_method}_k{k}.json"
+    payload = [
+        {
+            "cluster_id": r.cluster_id,
+            "label": r.label,
+            "size": r.size,
+            "member_indices": r.member_indices,
+            "centroid": r.centroid,
+            "captions": r.captions,
+            "representative_paths": r.representative_paths,
+        }
+        for r in records
+    ]
+    axes_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(
+        "Cached %d combined labeled axes (method=%s, k=%d) for pair (%s, %s)",
+        len(records), linkage_method, k, root_path_a, root_path_b,
+    )
+
+
+def load_pair_axes(
+    root_path_a: str | Path, root_path_b: str | Path, k: int, linkage_method: str = "ward"
+) -> list[AxisRecord] | None:
+    cache_dir = _pair_cache_dir(root_path_a, root_path_b)
+    axes_file = cache_dir / f"axes_{linkage_method}_k{k}.json"
+    if not axes_file.exists():
+        return None
+    payload = json.loads(axes_file.read_text(encoding="utf-8"))
+    return [
+        AxisRecord(
+            cluster_id=item["cluster_id"],
+            label=item["label"],
+            size=item["size"],
+            member_indices=item["member_indices"],
+            centroid=item["centroid"],
+            captions=item["captions"],
+            representative_paths=item["representative_paths"],
+        )
+        for item in payload
+    ]
+
+
+def invalidate_pair_tree_and_axes(root_path_a: str | Path, root_path_b: str | Path) -> None:
+    """Same idea as invalidate_tree_and_axes, but for a combined-axes pair
+    — call whenever EITHER dataset's own embeddings have changed."""
+    cache_dir = _pair_cache_dir(root_path_a, root_path_b)
+    n_trees_removed = 0
+    for tree_file in cache_dir.glob("tree_*.npz"):
+        tree_file.unlink()
+        n_trees_removed += 1
+    n_axes_removed = 0
+    for axes_file in cache_dir.glob("axes_*_k*.json"):
+        axes_file.unlink()
+        n_axes_removed += 1
+    logger.info(
+        "Invalidated %d cached combined tree(s), %d cached combined axes file(s) for pair (%s, %s)",
+        n_trees_removed, n_axes_removed, root_path_a, root_path_b,
+    )

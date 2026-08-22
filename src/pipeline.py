@@ -258,6 +258,127 @@ def run_pipeline(
     return records
 
 
+def run_combined_pipeline(
+    root_path_a: str,
+    root_path_b: str,
+    k: int = 5,
+    recursive: bool = True,
+    linkage_method: str = "ward",
+    embedder: ClipEmbedder | None = None,
+    labeler: ClusterLabeler | None = None,
+) -> tuple[list[cache.AxisRecord], list[Path], np.ndarray, list[int]]:
+    """
+    Full pipeline for TWO dataset folders analyzed TOGETHER: embeddings
+    from both are pooled before clustering, so a theme present in only
+    ONE of the two datasets (e.g. many horses in B, none at all in A)
+    can still surface as its own axis — unlike scoring a comparison feed
+    against the primary's own already-fixed axes (get_embeddings_only),
+    this actually re-clusters over both.
+
+    Real cost, by design: unlike a plain comparison feed (embeddings
+    only, fast), this is a full re-clustering + re-captioning pass —
+    comparable in cost to a first-time Analyze — the first time this
+    exact PAIR of datasets is combined at this k/linkage_method. Cached
+    afterward per (pair, k, linkage_method), same as the single-dataset
+    pipeline.
+
+    Each dataset's OWN embeddings are still cached and reused
+    independently (via _update_embeddings_incrementally) — analyzing A
+    alone, or A combined with C, doesn't repeat A's embedding pass.
+
+    embedder / labeler: see run_pipeline — reuse already-loaded
+    @st.cache_resource instances from Streamlit to avoid reloading model
+    weights.
+
+    Returns (records, combined_paths, combined_embeddings, origin) —
+    origin[i] is 0 if combined_paths[i] belongs to root_path_a, 1 if it
+    belongs to root_path_b. combined_paths/combined_embeddings are
+    row-aligned with each other and with each record's member_indices,
+    same convention as the single-dataset pipeline's own paths/embeddings.
+
+    Known limitation: pair-level cache invalidation currently checks the
+    combined PATH SET only (images added/removed on either side) — an
+    image edited in place (same path, changed content, caught by each
+    dataset's OWN mtime tracking) does NOT currently invalidate an
+    already-cached combined tree/axes for this pair, since the path set
+    itself is unchanged. Rare in practice; noted rather than silently
+    left unhandled.
+    """
+    # Step 1: each dataset's own embeddings — cheap if already cached,
+    # incremental otherwise. No duplicated logic: this is the exact same
+    # per-dataset caching the single-dataset pipeline already uses.
+    paths_a, embeddings_a, skipped_a = _update_embeddings_incrementally(
+        root_path_a, recursive, embedder=embedder
+    )
+    paths_b, embeddings_b, skipped_b = _update_embeddings_incrementally(
+        root_path_b, recursive, embedder=embedder
+    )
+
+    combined_paths = list(paths_a) + list(paths_b)
+    combined_embeddings = np.concatenate([embeddings_a, embeddings_b], axis=0)
+    origin = [0] * len(paths_a) + [1] * len(paths_b)
+
+    # Step 2: invalidate the pair's cached tree/axes if either dataset's
+    # own composition (which images are present) has changed since this
+    # pair was last combined — mirrors the single-dataset invalidation
+    # pattern, applied at the pair level.
+    cached_combined_paths = cache.load_pair_combined_paths(root_path_a, root_path_b)
+    if cached_combined_paths is not None:
+        if {str(p) for p in cached_combined_paths} != {str(p) for p in combined_paths}:
+            logger.info(
+                "Dataset composition changed for pair (%s, %s) — invalidating combined axes",
+                root_path_a, root_path_b,
+            )
+            cache.invalidate_pair_tree_and_axes(root_path_a, root_path_b)
+    cache.save_pair_combined_paths(root_path_a, root_path_b, combined_paths)
+
+    # Step 3: hierarchical tree over the COMBINED embeddings — the
+    # clustering itself needs no changes at all to work on pooled
+    # embeddings from two datasets instead of one.
+    Z = cache.load_pair_tree(root_path_a, root_path_b, linkage_method=linkage_method)
+    if Z is not None:
+        engine = HierarchicalAxisEngine.from_cache(combined_embeddings, Z, linkage_method=linkage_method)
+        logger.info("Using cached combined hierarchical tree (%s)", linkage_method)
+    else:
+        logger.info(
+            "No cached combined tree (%s) — building hierarchical clustering over both datasets",
+            linkage_method,
+        )
+        engine = HierarchicalAxisEngine(linkage_method=linkage_method).fit(combined_embeddings)
+        cache.save_pair_tree(root_path_a, root_path_b, engine.Z, linkage_method=linkage_method)
+
+    clusters = engine.get_clusters(k)
+
+    # Step 4: labeled axes, cached per (pair, linkage_method, k).
+    records = cache.load_pair_axes(root_path_a, root_path_b, k, linkage_method=linkage_method)
+    if records is not None:
+        logger.info("Using cached combined labels for method=%s, k=%d", linkage_method, k)
+        return records, combined_paths, combined_embeddings, origin
+
+    logger.info(
+        "No cached combined labels for method=%s, k=%d — running captioning over both datasets",
+        linkage_method, k,
+    )
+    active_labeler = labeler if labeler is not None else ClusterLabeler()
+    cluster_labels = active_labeler.label_clusters(clusters, combined_embeddings, combined_paths)
+
+    clusters_by_id = {c.cluster_id: c for c in clusters}
+    records = [
+        cache.AxisRecord(
+            cluster_id=cl.cluster_id,
+            label=cl.label,
+            size=clusters_by_id[cl.cluster_id].size,
+            member_indices=clusters_by_id[cl.cluster_id].member_indices.tolist(),
+            centroid=clusters_by_id[cl.cluster_id].centroid.tolist(),
+            captions=cl.captions,
+            representative_paths=[str(p) for p in cl.representative_paths],
+        )
+        for cl in cluster_labels
+    ]
+    cache.save_pair_axes(root_path_a, root_path_b, k, records, linkage_method=linkage_method)
+    return records, combined_paths, combined_embeddings, origin
+
+
 if __name__ == "__main__":
     # Usage: python src\pipeline.py "E:\dataset_unificado" 8
     logging.basicConfig(level=logging.INFO)

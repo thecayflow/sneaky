@@ -15,6 +15,28 @@ Run with:
 
 from __future__ import annotations
 
+import logging
+import os
+
+# Silence Hugging Face Hub / transformers' own terminal noise (download
+# progress bars, "using a cached model" notices, etc.) — the env vars
+# must be set BEFORE huggingface_hub/transformers are ever imported
+# anywhere in the process (read once at THEIR OWN import time, not
+# re-checked later). Both are imported lazily elsewhere in this project
+# (see labeling.py's own docstring) — setting the env vars here, via
+# plain os.environ (no import of either library needed), keeps that lazy
+# loading intact while still guaranteeing the setting is in place well
+# before the first "Analyze" click actually triggers those imports. The
+# matching logger.setLevel calls are a belt-and-braces backup for any
+# message that doesn't respect the verbosity env var — safe to set
+# without importing either library, since Python's logging lets you
+# configure a logger by name whether or not anything has imported the
+# module that uses it yet.
+os.environ["HF_HUB_VERBOSITY"] = "error"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 import base64
 import io
 import random
@@ -42,7 +64,7 @@ from src.axes.hierarchical import MIN_AXES
 from src.axes.labeling import ClusterLabeler
 from src.embeddings.clip_embedder import ClipEmbedder
 from src.persistence import cache
-from src.pipeline import get_embeddings_only, run_pipeline
+from src.pipeline import get_embeddings_only, run_combined_pipeline, run_pipeline
 from src.scoring.scoring import (
     OTHER_LABEL,
     compute_score_matrix,
@@ -153,6 +175,14 @@ if "scatter_dismissed_path" not in st.session_state:
     st.session_state.scatter_dismissed_path = None
 if "compare_result" not in st.session_state:
     st.session_state.compare_result = None
+if "combined_base_axes" not in st.session_state:
+    # None = no comparison feed active, or combined re-clustering hasn't
+    # run yet for the current pair/k/linkage_method — full_axes' own
+    # construction below falls back to the primary's solo-dataset
+    # base_axes whenever this is None, so "no combined axes yet" and "no
+    # comparison at all" both degrade to the exact same, already-working
+    # single-dataset behavior.
+    st.session_state.combined_base_axes = None
 if "pdf_report_bytes" not in st.session_state:
     st.session_state.pdf_report_bytes = None
 if "similarity_chain_cache_key" not in st.session_state:
@@ -224,6 +254,50 @@ def run_analysis(path: str, k: int, linkage_method: str) -> None:
         "paths": paths,
     }
     st.session_state.viewing_axis = None
+
+
+def run_combined_analysis(primary_path: str, compare_path: str, k: int, linkage_method: str) -> None:
+    """
+    Re-clusters the primary + comparison feeds TOGETHER (see
+    run_combined_pipeline's own docstring for why: a theme present in
+    only ONE of the two datasets can still surface as its own axis this
+    way, unlike scoring the comparison feed against the primary's own
+    already-fixed axes). Stores the result in
+    st.session_state.combined_base_axes, which full_axes' construction
+    below prefers over the primary's own solo-dataset base_axes whenever
+    it's set — falls back automatically to the solo-dataset axes the
+    moment the comparison feed is removed (see "Remove comparison
+    feed"'s own reset of this same session_state key).
+
+    Real cost, same caveat as Load comparison feed's own caption: unlike
+    a plain comparison feed (embeddings only), this is comparable in
+    cost to a first-time Analyze the first time this exact pair is
+    combined at this k/linkage_method — cached afterward.
+    """
+    already_cached = (
+        cache.load_pair_axes(primary_path, compare_path, k, linkage_method=linkage_method) is not None
+    )
+    spinner_msg = (
+        "Loading cached combined axes..."
+        if already_cached
+        else "Re-clustering both datasets together — first run for this pair (or this k/method) "
+        "can take several minutes (embeddings + captioning over both feeds). Later runs will be "
+        "much faster."
+    )
+    with st.spinner(spinner_msg):
+        try:
+            records, _combined_paths, _combined_embeddings, _origin = run_combined_pipeline(
+                primary_path,
+                compare_path,
+                k=k,
+                linkage_method=linkage_method,
+                embedder=get_embedder(),
+                labeler=get_labeler(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Something went wrong combining both feeds: {exc}")
+            return
+    st.session_state.combined_base_axes = records
 
 
 def _open_axis_dialog(label: str, scope: str = "primary") -> None:
@@ -779,54 +853,72 @@ def show_axis_images_dialog(
         st.caption("— end of results —")
 
 
+def _load_and_combine_comparison(compare_path: str, primary_path: str, k: int, linkage_method: str) -> bool:
+    """
+    Fetches the comparison feed's embeddings and combines it with the
+    primary — shared by both entry points: filling in the second path
+    up front (right before "Analyze") and adding a comparison later via
+    "Load comparison feed", so the two flows behave identically instead
+    of drifting apart over time. Returns True on success (result stored
+    in session_state), False if something went wrong (already reported
+    to the user via st.error).
+    """
+    with st.spinner("Loading comparison feed — reading its images..."):
+        try:
+            c_paths, c_embeddings, _ = get_embeddings_only(compare_path, embedder=get_embedder())
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Something went wrong loading the second feed: {exc}")
+            return False
+    st.session_state.compare_result = {
+        "path": compare_path,
+        "dataset_name": Path(compare_path).name,
+        "paths": c_paths,
+        "embeddings": c_embeddings,
+    }
+    run_combined_analysis(primary_path, compare_path, k, linkage_method)
+    return True
+
+
 path = st.text_input(
     "Dataset folder path",
-    placeholder=r"C:\Projects\sneaky\dataset_samples\sample_01",
+    placeholder=r"C:\Projects\sneakyreport\dataset_samples\sample_01",
     help="Any local folder — subfolders are searched too. Nothing is copied.",
 )
+compare_path = st.text_input(
+    "Second feed folder path (optional)",
+    key="compare_path_input",
+    placeholder=r"C:\Projects\sneakyreport\dataset_samples\sample_02",
+    help="Fill this in and click Analyze below to re-cluster both datasets together, so a "
+    "theme present in only one of the two (e.g. many horses in the second feed, none at "
+    "all in the first) can still surface as its own axis. Leave it blank to analyze just "
+    "the first dataset — you can always come back and fill it in later.",
+)
 
-with st.expander("Compare with a second feed (optional)"):
+
+def _remove_comparison() -> None:
+    """
+    Bound as this button's on_click (rather than checked after a plain
+    st.button()) specifically so it can also clear the second path
+    field's own text — a widget's session_state key can only be
+    reassigned in a callback, BEFORE that widget is re-instantiated on
+    the rerun the callback itself triggers; doing this inline after the
+    text_input above has already rendered this run would raise.
+    """
+    st.session_state.compare_result = None
+    st.session_state.combined_base_axes = None
+    st.session_state.compare_path_input = ""
+
+
+st.button(
+    "Remove comparison feed",
+    disabled=st.session_state.compare_result is None,
+    on_click=_remove_comparison,
+)
+if st.session_state.compare_result is not None:
     st.caption(
-        "The comparison feed doesn't get its own axes — its images are scored "
-        "against the axes of the primary feed above, so the radar shows how "
-        "differently it fits the same categories."
+        f"Comparing against: {st.session_state.compare_result['dataset_name']} "
+        f"({len(st.session_state.compare_result['paths'])} images)"
     )
-    compare_path = st.text_input(
-        "Second feed folder path",
-        key="compare_path_input",
-        placeholder=r"C:\Projects\sneaky\dataset_samples\sample_02",
-    )
-    if st.button("Load comparison feed"):
-        if not compare_path:
-            st.error("Please enter a folder path.")
-        elif not Path(compare_path).exists() or not Path(compare_path).is_dir():
-            st.error(f"'{compare_path}' is not a valid folder.")
-        else:
-            with st.spinner(
-                "Loading comparison feed — embeddings only, no clustering needed "
-                "since it reuses the primary feed's axes."
-            ):
-                try:
-                    c_paths, c_embeddings, _ = get_embeddings_only(compare_path, embedder=get_embedder())
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Something went wrong loading this feed: {exc}")
-                    c_paths = None
-            if c_paths is not None:
-                st.session_state.compare_result = {
-                    "path": compare_path,
-                    "dataset_name": Path(compare_path).name,
-                    "paths": c_paths,
-                    "embeddings": c_embeddings,
-                }
-                st.rerun()
-    if st.session_state.compare_result is not None:
-        st.success(
-            f"Comparing against: {st.session_state.compare_result['dataset_name']} "
-            f"({len(st.session_state.compare_result['paths'])} images)"
-        )
-        if st.button("Remove comparison feed"):
-            st.session_state.compare_result = None
-            st.rerun()
 
 new_k = st.number_input(
     "Axis number:",
@@ -841,6 +933,10 @@ if new_k != st.session_state.k:
     st.session_state.k = new_k
     if path and st.session_state.last_result and st.session_state.last_result["path"] == path:
         run_analysis(path, st.session_state.k, st.session_state.linkage_method)
+        if st.session_state.compare_result is not None:
+            run_combined_analysis(
+                path, st.session_state.compare_result["path"], st.session_state.k, st.session_state.linkage_method
+            )
 
 linkage_choice = st.radio(
     "Clustering method",
@@ -857,28 +953,62 @@ if linkage_choice != st.session_state.linkage_method:
     st.session_state.linkage_method = linkage_choice
     if path and st.session_state.last_result and st.session_state.last_result["path"] == path:
         run_analysis(path, st.session_state.k, st.session_state.linkage_method)
+        if st.session_state.compare_result is not None:
+            run_combined_analysis(
+                path, st.session_state.compare_result["path"], st.session_state.k, st.session_state.linkage_method
+            )
 
 if st.button("Analyze", type="primary"):
-    if not path:
+    if not path and compare_path:
+        st.error(
+            "To compare two datasets, fill in the first (primary) folder path too — "
+            "not just the second one."
+        )
+    elif not path:
         st.error("Please enter a folder path.")
     elif not Path(path).exists() or not Path(path).is_dir():
         st.error(f"'{path}' is not a valid folder.")
+    elif compare_path and (not Path(compare_path).exists() or not Path(compare_path).is_dir()):
+        st.error(f"'{compare_path}' is not a valid folder.")
     else:
         run_analysis(path, st.session_state.k, st.session_state.linkage_method)
+        if compare_path:
+            _load_and_combine_comparison(compare_path, path, st.session_state.k, st.session_state.linkage_method)
+        else:
+            # The second path field is empty right now — even if a
+            # comparison was active from before, an empty field is treated
+            # the same as clicking "Remove comparison feed" (same intent),
+            # rather than silently keeping a stale comparison the user
+            # visibly cleared but didn't explicitly remove.
+            st.session_state.compare_result = None
+            st.session_state.combined_base_axes = None
 
 result = st.session_state.last_result
 if result is not None:
     embedder = get_embedder()
+    compare_result = st.session_state.compare_result
+
+    # Auto-detected base: when a comparison feed is active AND has
+    # already been combined at the current k/linkage_method, use the
+    # COMBINED axes (which can include a theme present in only ONE of
+    # the two datasets, e.g. many horses in the second feed and none at
+    # all in the first) — otherwise fall back to the primary's own
+    # solo-dataset axes, exactly as before this feature existed. Falls
+    # back automatically the moment the comparison feed is removed (see
+    # "Remove comparison feed" resetting combined_base_axes to None).
+    base_axes_source = (
+        st.session_state.combined_base_axes
+        if compare_result is not None and st.session_state.combined_base_axes is not None
+        else result["base_axes"]
+    )
 
     # Build the full active axis set: auto-detected (minus any the user
     # excluded) + custom, in that order.
     full_axes = [
-        a for a in result["base_axes"] if a.label not in st.session_state.excluded_axis_labels
+        a for a in base_axes_source if a.label not in st.session_state.excluded_axis_labels
     ]
     for i, label in enumerate(st.session_state.custom_axis_labels):
         full_axes.append(create_custom_axis(embedder, label, i))
-
-    compare_result = st.session_state.compare_result
 
     # Computed ONCE here, reused by every scoring call below (axis counts,
     # radar, scatter, View images, Copy images, PDF metrics) — see
@@ -1195,7 +1325,7 @@ if result is not None:
     st.text_input(
         "Copy destination folder",
         key="copy_destination_input",
-        placeholder=r"C:\Projects\sneaky\dataset_samples\dataset_copy",
+        placeholder=r"C:\Projects\sneakyreport\dataset_samples\dataset_copy",
         help="Used by every 'Copy images to...' button above — set it "
         "once, then click 'Copy images to...' on as many axes as you "
         "like; they all land in this same folder (created automatically "
@@ -1236,7 +1366,7 @@ if result is not None:
         # with the same name.
         active_auto_labels = {
             a.label.lower()
-            for a in result["base_axes"]
+            for a in base_axes_source
             if a.label not in st.session_state.excluded_axis_labels
         }
         active_custom_labels = {lbl.lower() for lbl in st.session_state.custom_axis_labels}

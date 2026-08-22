@@ -843,6 +843,21 @@ def _render_treemap(
     max_val = max(values) if values else 1
     legend_handles = None
 
+    def _label_fits(text: str, fontsize: float, font_kwargs: dict, max_w: float, max_h: float) -> bool:
+        """
+        Renders `text` temporarily to measure its ACTUAL rendered size in
+        data coordinates (not an approximation from character count —
+        real glyph widths vary too much for that to be reliable), then
+        removes it. A small margin (0.85) is applied to both dimensions
+        so the label doesn't sit flush against a cell's edges even when
+        it technically fits.
+        """
+        t = ax.text(0, 0, text, fontsize=fontsize, **font_kwargs)
+        fig.canvas.draw()
+        bbox_data = t.get_window_extent(renderer=fig.canvas.get_renderer()).transformed(ax.transData.inverted())
+        t.remove()
+        return bbox_data.width <= max_w * 0.85 and bbox_data.height <= max_h * 0.85
+
     for (rx, ry, rw, rh), label, value in zip(rects, labels, values):
         pct = value / total * 100
         breakdown = axis_sizes_breakdown.get(label) if axis_sizes_breakdown else None
@@ -888,54 +903,44 @@ def _render_treemap(
             if legend_handles is None:
                 legend_handles = [Patch(facecolor=p["color"], label=p["name"]) for p in breakdown]
 
-            # Short/wide rows (e.g. the smallest axes, squeezed into a
-            # thin band) don't have room for BOTH the top-positioned axis
-            # label and a separately-positioned sub-box percentage
-            # without the two colliding — fall back to a single centered
-            # label for the whole box, same as the single-dataset case
-            # below, and skip the per-sub-box percentages entirely there.
-            if rw > 35 and rh > 45:
-                ax.text(
-                    rx + rw / 2, ry + rh * 0.12, label, ha="center", va="top",
-                    fontsize=8, color="white", **_mpl_font("bold"),
-                )
-                # Each sub-box's own percentage, centered within ITS OWN
-                # area (below where the axis label sits) — this is what
-                # gives the smaller (often comparison-dataset) sub-box a
-                # visible number of its own, instead of just an unlabeled
-                # sliver of color.
-                for sub_x, sub_y, sub_w, sub_h, sub_pct in sub_boxes:
-                    if sub_w > 22 and sub_h > 20:
-                        ax.text(
-                            sub_x + sub_w / 2, sub_y + sub_h * 0.62, f"{sub_pct:.1f}%",
-                            ha="center", va="center", fontsize=7, color="white", **_mpl_font("regular"),
-                        )
-            elif rw > 35 and rh > 20:
-                ax.text(
-                    rx + rw / 2, ry + rh / 2, label, ha="center", va="center",
-                    fontsize=8, color="white", **_mpl_font("bold"),
-                )
+            # Same "label (pct%)" single-line approach as the no-breakdown
+            # case, applied per sub-box — the axis name used to sit once,
+            # shared, above the whole box, with each sub-box's percentage
+            # positioned independently below it; that shared-label
+            # approach is what let a small sub-box collide with it. Each
+            # sub-box now carries its own self-contained text instead: the
+            # FIRST (largest, by construction — breakdown is built primary
+            # dataset first) gets "label (pct%)"; the rest just "(pct%)",
+            # since they're already visually grouped under the same axis
+            # rectangle. Measured for real per sub-box, same as before —
+            # a sub-box too small for even its own short text just gets
+            # nothing, rather than colliding with anything else.
+            for i, (sub_x, sub_y, sub_w, sub_h, sub_pct) in enumerate(sub_boxes):
+                text = f"{label} ({sub_pct:.1f}%)" if i == 0 else f"({sub_pct:.1f}%)"
+                kwargs = {"ha": "center", "va": "center", "color": "white", **_mpl_font("bold" if i == 0 else "regular")}
+                fontsize = 8 if i == 0 else 7
+                if sub_w > 18 and sub_h > 12 and _label_fits(text, fontsize, kwargs, sub_w, sub_h):
+                    ax.text(sub_x + sub_w / 2, sub_y + sub_h / 2, text, fontsize=fontsize, **kwargs)
         else:
             norm = value / max_val
             color = _lerp_hex(MPL_ACCENT_200, MPL_ACCENT_800, 0.15 + 0.85 * norm)
             ax.add_patch(plt.Rectangle((rx, ry), rw, rh, facecolor=color, edgecolor=MPL_BG, linewidth=2))
             text_color = "white" if norm > 0.45 else MPL_TEXT
 
-            if rw > 35 and rh > 20:
-                if rh > 32:
-                    ax.text(
-                        rx + rw / 2, ry + rh / 2, label, ha="center", va="bottom",
-                        fontsize=8, color=text_color, **_mpl_font("bold"),
-                    )
-                    ax.text(
-                        rx + rw / 2, ry + rh / 2, f"({pct:.1f}%)", ha="center", va="top",
-                        fontsize=7, color=text_color, **_mpl_font("regular"),
-                    )
-                else:
-                    ax.text(
-                        rx + rw / 2, ry + rh / 2, label, ha="center", va="center",
-                        fontsize=8, color=text_color, **_mpl_font("bold"),
-                    )
+            # Single line "label (pct%)" instead of two stacked lines —
+            # two independently-positioned lines anchored to the same
+            # center point could collide once a cell's height was only
+            # just above the old two-line threshold, not comfortably
+            # above it. A single line collapses that failure mode: it
+            # either clearly fits or it doesn't, checked against the
+            # label's OWN actual rendered width (a long label needs more
+            # room than a short one at the same cell size) rather than a
+            # fixed cell-size threshold that doesn't know the label's
+            # length at all.
+            combined_text = f"{label} ({pct:.1f}%)"
+            bold_kwargs = {"ha": "center", "va": "center", "color": text_color, **_mpl_font("bold")}
+            if rw > 20 and rh > 14 and _label_fits(combined_text, 8, bold_kwargs, rw, rh):
+                ax.text(rx + rw / 2, ry + rh / 2, combined_text, fontsize=8, **bold_kwargs)
     ax.set_xlim(0, W)
     ax.set_ylim(0, H)
     ax.invert_yaxis()
