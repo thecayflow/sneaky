@@ -2012,7 +2012,7 @@ def generate_pdf_report(
         )
         story.append(Spacer(1, SP_4))
 
-        n_cols = 4
+        n_cols = 5
         thumb_w = portrait_w / n_cols - 14
         cells = []
         for label, img_path in representative_images:
