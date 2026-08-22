@@ -814,7 +814,7 @@ def show_axis_images_dialog(
                 with Image.open(st.session_state.zoomed_image_path) as im:
                     im = ImageOps.exif_transpose(im)
                     im.thumbnail((1600, 1600))
-                    st.image(im, width="stretch")
+                    st.image(im, width="stretch", caption=st.session_state.zoomed_image_path)
             except Exception:  # noqa: BLE001
                 st.error(f"Couldn't load {st.session_state.zoomed_image_path}")
         return
@@ -828,7 +828,7 @@ def show_axis_images_dialog(
                 try:
                     with Image.open(img_path) as im:
                         im = ImageOps.exif_transpose(im)
-                        caption = f"similarity: {score:.3f}"
+                        caption = f"{img_path.name} · similarity: {score:.3f}"
                         if ds_name is not None:
                             dot = "🔵" if ds_name == primary_dataset_name else "🟠"
                             caption = f"{dot} {ds_name} · {caption}"
