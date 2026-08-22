@@ -115,6 +115,7 @@ def _register_fonts() -> dict[str, str]:
         "body_regular": ("Barlow-Regular.ttf", "Helvetica"),
         "body_medium": ("Barlow-Medium.ttf", "Helvetica-Bold"),
         "body_bold": ("Barlow-Bold.ttf", "Helvetica-Bold"),
+        "body_italic": ("Barlow-Italic.ttf", "Helvetica-Oblique"),
     }
     resolved = {}
     for key, (filename, fallback) in names.items():
@@ -267,7 +268,14 @@ class _Blueprint(Flowable):
 def _paint_page(canv, doc):
     """Fills the page with the system's ground color and adds a hairline
     footer rule + page number — a technical-sheet touch that also makes
-    every page (portrait or landscape) unmistakably part of one document."""
+    every page (portrait or landscape) unmistakably part of one document.
+
+    The footer brand mark is two runs of text drawn side by side (not one
+    Paragraph) — canvas-level drawString only takes a single font per
+    call, so "sneakyReport™" (bold) and "Visual Dataset Intelligence"
+    (italic) are drawn as two separate calls, with the second positioned
+    right after the first using stringWidth to measure exactly how far
+    the first run reached."""
     w, h = canv._pagesize
     canv.saveState()
     canv.setFillColor(COLOR_BG)
@@ -275,10 +283,22 @@ def _paint_page(canv, doc):
     canv.setStrokeColor(COLOR_NEUTRAL_300)
     canv.setLineWidth(0.6)
     canv.line(PAGE_MARGIN, PAGE_MARGIN * 0.62, w - PAGE_MARGIN, PAGE_MARGIN * 0.62)
-    canv.setFont(FONT["body_regular"], 7.5)
+
+    footer_size = 7.5
+    footer_y = PAGE_MARGIN * 0.4
     canv.setFillColor(COLOR_NEUTRAL_600)
-    canv.drawString(PAGE_MARGIN, PAGE_MARGIN * 0.4, "SEMANTIC REPORT BY SNEAKY\u2122")
-    canv.drawRightString(w - PAGE_MARGIN, PAGE_MARGIN * 0.4, str(canv.getPageNumber()))
+
+    bold_text = "sneakyReport\u2122"
+    canv.setFont(FONT["body_bold"], footer_size)
+    canv.drawString(PAGE_MARGIN, footer_y, bold_text)
+    bold_width = canv.stringWidth(bold_text, FONT["body_bold"], footer_size)
+
+    italic_text = " \u2014 Visual Dataset Intelligence"
+    canv.setFont(FONT["body_italic"], footer_size)
+    canv.drawString(PAGE_MARGIN + bold_width, footer_y, italic_text)
+
+    canv.setFont(FONT["body_regular"], footer_size)
+    canv.drawRightString(w - PAGE_MARGIN, footer_y, str(canv.getPageNumber()))
     canv.restoreState()
 
 
@@ -1521,7 +1541,7 @@ def generate_pdf_report(
         rightMargin=PAGE_MARGIN,
         topMargin=PAGE_MARGIN,
         bottomMargin=PAGE_MARGIN,
-        title=f"Semantic Report by sneaky\u2122 — {report_title_names}",
+        title=f"sneakyReport\u2122 — {report_title_names}",
     )
     doc.addPageTemplates(
         [
@@ -1545,7 +1565,13 @@ def generate_pdf_report(
     # --- Header — dataset name leads (it's the thing that changes report
     # to report); "Dataset Report" becomes a small kicker label above it,
     # like a title block on a technical drawing. -------------------------
-    story.append(Paragraph("SEMANTIC REPORT BY SNEAKY\u2122", styles["kicker"]))
+    story.append(
+        Paragraph(
+            f'<font name="{FONT["body_bold"]}">sneakyReport\u2122</font> \u2014 '
+            f'<font name="{FONT["body_italic"]}">Visual Dataset Intelligence</font>',
+            styles["kicker"],
+        )
+    )
     story.append(Spacer(1, SP_1))
     story.append(Paragraph(report_title_names, styles["title"]))
     story.append(Spacer(1, SP_1))

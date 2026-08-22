@@ -1,8 +1,9 @@
 """
 check_install.py
 
-Standalone installation sanity check for sneaky(TM) Semantic Report — run
-automatically at the end of install.bat, or any time by hand with:
+Standalone installation sanity check for sneakyReport(TM) — Visual Dataset
+Intelligence — run automatically at the end of install.bat, or any time by
+hand with:
 
     python check_install.py
 
@@ -61,7 +62,7 @@ def _check_spacy_model() -> bool:
 
 
 def main() -> int:
-    print("Checking sneaky installation...\n")
+    print("Checking sneakyReport(TM) installation...\n")
 
     # Critical: any of these failing means the app genuinely can't run —
     # these decide the exit code that install.bat checks.
@@ -88,7 +89,7 @@ def main() -> int:
 
     print()
     if all(critical_results):
-        print("sneaky installation successful!")
+        print("sneakyReport(TM) installation successful!")
         if not has_cuda:
             print(
                 "Note: no CUDA-capable GPU was detected — the app will still run, "

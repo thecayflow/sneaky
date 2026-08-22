@@ -20,6 +20,7 @@ import io
 import random
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -80,9 +81,9 @@ THUMB_BATCH_SIZE = 24  # how many more thumbnails "Load more" reveals each click
 THUMB_COLUMNS = 4
 SIMILARITY_CHAIN_THUMB_SIZE = 140  # px, for the horizontal-scroll chain
 
-st.set_page_config(page_title="sneaky™ Semantic Report", layout="centered")
+st.set_page_config(page_title="sneakyReport™ — Visual Dataset Intelligence", layout="centered")
 
-st.title("sneaky™ Semantic Report")
+st.title("sneakyReport™ — Visual Dataset Intelligence")
 st.caption(
     "Point this at any local folder of images to see its semantic makeup as a radar chart. "
     "Use the 'View images' button next to any axis to browse the images behind it."
@@ -1889,10 +1890,17 @@ if result is not None:
             )
 
     if st.session_state.pdf_report_bytes:
+        today_str = datetime.now().strftime("%Y%m%d")
+        if compare_result is not None:
+            pdf_file_name = (
+                f"sneakyReport_{result['dataset_name']}_vs_{compare_result['dataset_name']}_{today_str}.pdf"
+            )
+        else:
+            pdf_file_name = f"sneakyReport_{result['dataset_name']}_{today_str}.pdf"
         st.download_button(
             "Download PDF Report",
             data=st.session_state.pdf_report_bytes,
-            file_name=f"dataset_report_{result['dataset_name']}.pdf",
+            file_name=pdf_file_name,
             mime="application/pdf",
         )
 
