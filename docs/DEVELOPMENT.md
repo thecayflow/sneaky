@@ -1,6 +1,6 @@
 # Development notes
 
-Technical documentation for working on Sneaky's codebase — manual
+Technical documentation for working on sneakyReport's codebase — manual
 installation (without `install.bat`), project structure, and design
 decisions worth understanding before making changes. See the root
 `README.md` for the product-facing overview and the normal install path.
@@ -31,8 +31,7 @@ just with a fallback font (Helvetica).
 
 See the folder tree under `src/` — each module has a single responsibility
 (ingestion, embeddings, axes, scoring, viz, similarity, report,
-persistence). See `BACKLOG.md` for the current status of phases and
-pending improvements.
+persistence).
 
 ## Design decisions
 
@@ -136,11 +135,19 @@ anything, and compares the current image list against what was cached
 - If there are new images, embeddings are generated *only* for those — the
   rest are reused without recomputation.
 - If images were deleted, their embeddings are dropped from the cache.
-- In either of the last two cases, the hierarchical tree and the per-k
-  labels are invalidated (`cache.invalidate_tree_and_axes`), since they
-  were computed from the old dataset composition — but this recomputes
-  quickly (tens of seconds), since the real expense is the embeddings, not
-  the clustering or labeling.
+- If an EXISTING image's content changes in place (same filename, edited
+  file — a modification time comparison, not just the path set, is what
+  catches this), it's treated the same as a new image: only that one gets
+  re-embedded, not the whole dataset. Each dataset's `mtimes.json` records
+  what the file's modification time was the last time it was embedded — a
+  dataset cached before this existed simply has no recorded mtime yet, and
+  a missing entry is treated as "unchanged" rather than forcing a
+  needless full re-embed the first time this runs on an older cache.
+- In any of the above cases beyond "nothing changed", the hierarchical
+  tree and the per-k labels are invalidated (`cache.invalidate_tree_and_axes`),
+  since they were computed from the old dataset composition — but this
+  recomputes quickly (tens of seconds), since the real expense is the
+  embeddings, not the clustering or labeling.
 
 The cache can also be managed manually from the UI itself ("Cache
 management", at the bottom of the page) without touching disk by hand.
@@ -238,3 +245,136 @@ every individual observation was consistent with those theories too. When
 a plain function starts behaving like it opens a dialog (title matches, a
 return value goes missing), check the decorators above it before assuming
 the bug is in the function's own logic.
+
+### Scoring standardization drifting per-dataset when a comparison feed is active
+
+**When**: while building out dataset comparison — an axis with genuinely
+zero matching images in one dataset was still claiming images there.
+
+**What happened**: with a comparison feed loaded, `scoring.py`'s dominant-
+axis assignment (`get_dominant_labels` and everything built on it — axis
+counts, the radar, "View images", the PDF) standardized (z-scored) each
+dataset's raw cosine similarities against **its own** distribution before
+comparing axes. Two concrete symptoms this caused:
+- An axis with a real concept absent from one dataset (e.g. "owl", with
+  zero actual owls in that dataset) could still get 20+ images assigned
+  to it there — z-scoring within that dataset alone just picks out
+  whichever axis happens to score *relatively* highest, even if every raw
+  similarity is low across the board.
+- A custom TEXT axis (e.g. "Horse", added by the user, scored against
+  CLIP's text embedding rather than an image centroid) could win purely on
+  z-score even when its raw cosine similarity to every image was
+  genuinely too low to mean anything — text-vs-image CLIP similarities
+  sit on a different absolute scale than image-vs-image ones (the
+  "modality gap"), so a text axis's z-score isn't directly comparable to
+  an auto-detected axis's.
+
+**Why it happened**: standardizing each dataset against its own
+distribution assumes the two distributions are equivalent enough to
+compare directly — reasonable for a single dataset, not once a second
+one with a genuinely different composition enters the picture. Each
+dataset ends up graded on its own curve, so "best-scoring axis in THIS
+dataset" and "best-scoring axis considering BOTH" can disagree.
+
+**Fix applied**, in `scoring.py` and `app.py`:
+1. `get_dominant_labels`, `get_axis_counts_by_dominance`,
+   `get_ranked_images_for_axis`, and `get_radar_values_by_dominance` all
+   accept an optional `standardize_reference` — a pooled score matrix to
+   standardize against, instead of each dataset's own.
+2. When a comparison feed is active, `app.py::_pooled_score_reference`
+   computes this pooled reference **once**, from both datasets' combined
+   scores, and passes it to every one of the ~9 call sites that score
+   either dataset — found by grepping for all four function names above,
+   not just the obvious ones (two PDF-specific call sites were missed on
+   the first pass and only caught in a later round).
+3. `CUSTOM_AXIS_MIN_SIMILARITY = 0.20` — a custom (text) axis must clear
+   this **raw cosine floor** to claim an image at all; failing that, it's
+   disqualified as a candidate for that image (which moves to its next-
+   best axis, not straight to "Other") regardless of how favorable its
+   z-score looks. This is what actually fixed the "Horse" case above.
+
+**Why it matters going forward**: any NEW function added to `scoring.py`
+that standardizes per-dataset similarities needs the same
+`standardize_reference` treatment the moment dataset comparison is in
+play — the bug doesn't announce itself with an exception, just with axes
+quietly claiming images they have no real business claiming. When
+debugging "why does this axis have images that don't belong," check
+whether the call site in question received the pooled reference before
+looking anywhere else.
+
+### Combined axis extraction — re-clustering both datasets together
+
+**When**: after Fase 2 (comparison scoring) was already working — the
+user wanted a theme present in only ONE of two compared datasets (e.g.
+many horses in the second feed, none at all in the first) to be able to
+surface as its own axis, not just get silently absorbed into whichever
+existing axis scored closest.
+
+**What happened / why the change was needed**: axes were always computed
+(hierarchical clustering + BLIP captioning) from the PRIMARY dataset
+alone, before a comparison feed even entered the picture — a comparison
+feed's images were only ever *scored* against those already-fixed axes
+(`get_embeddings_only`, no clustering of its own). A concept entirely
+absent from the primary dataset had no way to become its own axis, no
+matter how much of the comparison dataset it made up.
+
+**Design options considered**: (A) always re-cluster over BOTH datasets'
+pooled embeddings whenever a comparison feed is active; (B) leave the
+primary's own axes untouched, and only look for coherent "gap" groups
+among the comparison feed's own leftover ("Other") images, suggesting new
+axes asymmetrically; (C) an explicit "analyze as a comparison" mode where
+both paths are required up front, before any clustering happens at all.
+**Chosen: (A)** — the user judged it "the most honest" approach worth the
+real cost tradeoff it implies (below), rather than a cheaper approximation.
+
+**Fix applied**:
+- `cache.py`: a cache location keyed by the PAIR of dataset paths, not
+  just one (`_pair_cache_dir` — hashes the two paths **sorted**, so
+  comparing A-vs-B and B-vs-A hit the exact same cache entry). Stores its
+  own tree/axes (`save_pair_tree`/`load_pair_tree`/`save_pair_axes`/
+  `load_pair_axes`), invalidated (`invalidate_pair_tree_and_axes`) when
+  the pooled path set changes on either side.
+- `pipeline.py::run_combined_pipeline`: fetches each dataset's OWN
+  embeddings independently (reusing each one's existing per-dataset cache
+  — analyzing A alone, or A combined with C, never repeats A's embedding
+  pass), concatenates them, and runs the SAME clustering/captioning
+  pipeline as a single-dataset analysis over the pooled result — the
+  clustering itself needed zero changes to work on pooled embeddings from
+  two sources instead of one.
+- `app.py`: `full_axes`'s auto-detected component switches between the
+  combined result (`combined_base_axes`, when a comparison is active and
+  already combined at the current k/method) and the primary's own
+  solo-dataset axes, falling back to solo automatically the moment the
+  comparison is removed. Every downstream consumer (axis counts, radar,
+  scatter, PDF, "View images") needed NO changes — they already operated
+  generically on "whatever full_axes currently is."
+
+**Real cost, by design**: unlike scoring a comparison feed against
+already-fixed axes (cheap), this is comparable in cost to a first-time
+Analyze the first time a given PAIR of datasets is combined at a given
+k/linkage_method — full re-clustering + re-captioning, not just an
+embeddings pass. Cached afterward per (pair, k, method), same as the
+single-dataset pipeline. The user explicitly accepted this tradeoff
+before implementation began.
+
+**UI iteration worth knowing about**: the first version placed a "Load
+comparison feed" button ABOVE "Analyze," meant only for adding a
+comparison to an already-analyzed primary — but nothing stopped someone
+who'd just filled in both paths from clicking it first, hitting a
+confusing "analyze the primary first" error despite having just done
+exactly that (in their own mental model). Fixed by only rendering that
+button once a primary result already exists, then simplified further:
+both path fields are always visible up front, "Analyze" alone handles
+every case (solo, solo-then-add-later, combined-from-the-start) by
+checking whether the second field has content, and a "Remove comparison
+feed" button stays disabled until there's an actual comparison loaded to
+remove.
+
+**Known limitation**: pair-level cache invalidation currently checks the
+combined PATH SET only. An image edited in place (same path, changed
+content — caught by each dataset's own `mtimes.json`, see the
+"Incremental cache updates" section above) does NOT currently invalidate
+an already-cached combined tree/axes for that pair, since the path set
+itself hasn't changed. Noted rather than silently left unhandled; low
+priority given how rarely someone edits an image in place without
+renaming it.

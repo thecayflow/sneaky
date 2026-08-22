@@ -32,10 +32,23 @@ import os
 # without importing either library, since Python's logging lets you
 # configure a logger by name whether or not anything has imported the
 # module that uses it yet.
-os.environ["HF_HUB_VERBOSITY"] = "error"
-os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
-logging.getLogger("transformers").setLevel(logging.ERROR)
+#
+# CRITICAL, not ERROR: some of transformers' own internal noise (e.g. its
+# processor-registration self-check at import time, unrelated to BLIP —
+# confirmed by seeing "[ERROR] `high_res_size` is part of
+# DeepseekVLHybridImageProcessorKwargs, but not documented..." in an
+# actual run, for a model this project never uses) is logged AT the
+# ERROR level itself. A threshold of ERROR only filters what's BELOW
+# ERROR (DEBUG/INFO/WARNING) — it does nothing to messages already AT
+# that level. CRITICAL is the level above it, so it's the one that
+# actually silences these. A genuine BLIP failure would still surface as
+# a raised Python exception (a crash, not just a log line), so raising
+# the log threshold this far doesn't hide anything that would otherwise
+# stop the pipeline.
+os.environ["HF_HUB_VERBOSITY"] = "critical"
+os.environ["TRANSFORMERS_VERBOSITY"] = "critical"
+logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
+logging.getLogger("transformers").setLevel(logging.CRITICAL)
 
 import base64
 import io

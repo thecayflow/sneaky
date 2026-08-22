@@ -42,6 +42,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.append(str(_PROJECT_ROOT))
 
+import contextlib
+import io
 import logging
 import math
 import re
@@ -353,37 +355,60 @@ class ClusterLabeler:
 
     def __init__(self, model_name: str = DEFAULT_CAPTION_MODEL, device: str | None = None) -> None:
         import torch
-        from transformers import BlipForConditionalGeneration, BlipProcessor
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         logger.info("Loading captioning model %s on %s", model_name, self.device)
 
-        self.processor = BlipProcessor.from_pretrained(model_name)
-        # use_safetensors=True avoids transformers' torch.load safety block
-        # (torch < 2.6 can't load pickle .bin checkpoints) by always fetching
-        # the .safetensors weights instead, which don't use pickle.
-        #
-        # low_cpu_mem_usage=False: with accelerate installed, transformers
-        # defaults to a "meta device" loading path (builds the model
-        # skeleton without real data first, fills it in afterward) to save
-        # RAM during loading. This BLIP checkpoint is missing one parameter
-        # (text_decoder.cls.predictions.decoder.bias — newly initialized,
-        # not part of the checkpoint), and that specific parameter can end
-        # up left on the meta device instead of properly materialized,
-        # making the .to(self.device) call below fail with "Cannot copy
-        # out of meta tensor; no data!". Disabling the meta-device path
-        # avoids this entirely — this model is small enough that the extra
-        # RAM during loading doesn't matter.
-        self.model = BlipForConditionalGeneration.from_pretrained(
-            model_name, use_safetensors=True, low_cpu_mem_usage=False
-        )
-        # Explicitly re-resolve tied weights (BLIP's text decoder head
-        # shares/ties its output bias with another layer) before moving
-        # off the meta device — without this, the tied parameter can stay
-        # a meta placeholder even with low_cpu_mem_usage=False, and .to()
-        # then fails with "Cannot copy out of meta tensor; no data!".
-        self.model.tie_weights()
-        self.model = self.model.to(self.device)
+        # transformers prints some of its own internal noise directly to
+        # stdout/stderr somewhere in this import + loading block — NOT
+        # through Python's logging module at all, confirmed by testing:
+        # these specific messages (about processor Kwargs documentation
+        # for models this project never uses — DeepSeek VL, Kimi, PaddleOCR
+        # VL — unrelated to BLIP) survived raising
+        # logging.getLogger("transformers") all the way to CRITICAL, the
+        # highest level there is. Redirecting stdout/stderr to a throwaway
+        # buffer for just this block catches it regardless of which exact
+        # line triggers it, rather than guessing at (and depending on) a
+        # specific mechanism that might move between transformers
+        # versions. A genuine failure here still raises a normal Python
+        # exception, which isn't affected by redirecting stdout/stderr and
+        # prints its own traceback normally once it propagates past this
+        # block — nothing here can hide a real error, only discard
+        # harmless print()-based noise.
+        _discard = io.StringIO()
+        with contextlib.redirect_stdout(_discard), contextlib.redirect_stderr(_discard):
+            from transformers import BlipForConditionalGeneration, BlipProcessor
+
+            self.processor = BlipProcessor.from_pretrained(model_name)
+            # use_safetensors=True avoids transformers' torch.load safety
+            # block (torch < 2.6 can't load pickle .bin checkpoints) by
+            # always fetching the .safetensors weights instead, which
+            # don't use pickle.
+            #
+            # low_cpu_mem_usage=False: with accelerate installed,
+            # transformers defaults to a "meta device" loading path
+            # (builds the model skeleton without real data first, fills
+            # it in afterward) to save RAM during loading. This BLIP
+            # checkpoint is missing one parameter
+            # (text_decoder.cls.predictions.decoder.bias — newly
+            # initialized, not part of the checkpoint), and that specific
+            # parameter can end up left on the meta device instead of
+            # properly materialized, making the .to(self.device) call
+            # below fail with "Cannot copy out of meta tensor; no data!".
+            # Disabling the meta-device path avoids this entirely — this
+            # model is small enough that the extra RAM during loading
+            # doesn't matter.
+            self.model = BlipForConditionalGeneration.from_pretrained(
+                model_name, use_safetensors=True, low_cpu_mem_usage=False
+            )
+            # Explicitly re-resolve tied weights (BLIP's text decoder head
+            # shares/ties its output bias with another layer) before
+            # moving off the meta device — without this, the tied
+            # parameter can stay a meta placeholder even with
+            # low_cpu_mem_usage=False, and .to() then fails with "Cannot
+            # copy out of meta tensor; no data!".
+            self.model.tie_weights()
+            self.model = self.model.to(self.device)
         self.model.eval()
 
     def _caption_image(self, path: Path) -> str:

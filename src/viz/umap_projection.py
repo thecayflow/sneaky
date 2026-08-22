@@ -69,7 +69,12 @@ def compute_umap_projection(
     logger.info(
         "Computing UMAP projection for %d embeddings (n_neighbors=%d)", n_samples, n_neighbors
     )
-    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, random_state=random_state)
+    # n_jobs=1 explicit: UMAP forces single-threaded execution internally
+    # whenever random_state is set (parallelism can't guarantee the exact
+    # same result run to run) — passing n_jobs=1 ourselves just says so
+    # up front, instead of leaving UMAP's default (which tries to use all
+    # cores) to get silently overridden and warn about it.
+    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, random_state=random_state, n_jobs=1)
     coords = reducer.fit_transform(working_space)
     logger.info("UMAP projection complete")
     return coords
