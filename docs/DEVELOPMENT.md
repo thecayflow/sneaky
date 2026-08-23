@@ -378,3 +378,63 @@ an already-cached combined tree/axes for that pair, since the path set
 itself hasn't changed. Noted rather than silently left unhandled; low
 priority given how rarely someone edits an image in place without
 renaming it.
+
+### Console noise from `transformers` about models this project never uses
+
+**When**: while polishing the terminal output ahead of the public beta —
+a dozen or so `[ERROR]` lines about `DeepseekVLHybridImageProcessorKwargs`,
+`Kimi_K25ImageProcessorKwargs`, and `PaddleOCRVLImageProcessorKwargs`
+appearing on every "Analyze," for model families this project has
+never imported or used anywhere.
+
+**What happened / dead ends worth knowing about**: several reasonable-
+looking fixes were tried, in order, before finding the real cause — worth
+recording so nobody repeats the same path:
+1. `logging.getLogger("transformers").setLevel(...)`, first at `ERROR`
+   then at `CRITICAL` — no effect. Turned out these lines are printed via
+   a plain `print()`, not Python's `logging` module at all, so no logger
+   configuration could ever touch them.
+2. `contextlib.redirect_stdout`/`redirect_stderr` scoped tightly around
+   every actual place `labeling.py` touches `transformers` (the import,
+   both `from_pretrained()` calls, and the `model.generate()` inference
+   call) — still no effect, which briefly (and incorrectly) suggested the
+   print was happening at the OS file-descriptor level, bypassing Python
+   entirely (e.g. from a Rust component).
+
+**The real cause**, found by temporarily monkey-patching `sys.stdout`/
+`sys.stderr` to dump a full call stack (`traceback.print_stack()`) the
+moment one of these lines was written, rather than continuing to guess:
+it has nothing to do with anything in this project's own code path.
+Streamlit's own file watcher (`streamlit/watcher/local_sources_watcher.py`)
+calls `hasattr(module, "__path__")` on every already-imported module on
+**every script rerun**, to decide what to watch for auto-reload. For the
+`transformers` module specifically — which defines its own lazy-import
+`__getattr__` in `transformers/__init__.py` — that innocuous `hasattr()`
+call triggers a full import of every registered model's image-processor
+class, including ones this project never uses, each carrying transformers'
+own `@auto_docstring` decorator, which prints this "undocumented
+parameter" notice as a side effect of being imported at all.
+
+**Fix applied**: `.streamlit/config.toml`, setting `fileWatcherType =
+"none"` — disables Streamlit's file watcher outright, removing the
+trigger entirely rather than filtering its symptom. Confirmed via an
+isolation test (running with ONLY this config change, no code-level
+filtering) that this alone is sufficient — no stdout/stderr filtering
+code was needed in the end.
+
+**Real tradeoff, not just a cosmetic setting**: this disables Streamlit's
+auto-reload-on-file-save entirely. Editing any `.py` file while `run.bat`
+is running no longer refreshes the browser automatically — restart it by
+hand to pick up changes. This has zero effect on anyone just USING the
+app (they never edit its source), but affects active development
+directly: expect to manually restart after every code change from now
+on. Normal widget-driven interactivity (clicking a button, a script
+rerunning in response) is unrelated to this setting and unaffected — that
+happens over the websocket connection, not the filesystem watcher.
+
+**Why it matters going forward**: if new console noise shows up that
+resists both logging configuration AND scoped stdout/stderr redirection
+around wherever it seems to originate, consider whether it might not be
+triggered by this project's own code at all — Streamlit's own file
+watcher re-touching every loaded module on every rerun is a real, easy-
+to-miss trigger for lazy-import side effects in large libraries.

@@ -417,7 +417,17 @@ class ClusterLabeler:
         with Image.open(path) as img:
             img = img.convert("RGB")
             inputs = self.processor(img, return_tensors="pt").to(self.device)
-        with torch.no_grad():
+        # Same stdout/stderr redirection as __init__'s model-loading block,
+        # and for the same reason: transformers' own print()-based noise
+        # (confirmed NOT to be Python logging — surviving both raising the
+        # logger to CRITICAL and redirecting stdout/stderr around loading)
+        # can apparently also fire lazily on the FIRST real inference call,
+        # not just at load time — this is the actual call that generates a
+        # caption, so it's the other place this needs covering. A genuine
+        # failure here still raises a normal Python exception, unaffected
+        # by the redirection.
+        _discard = io.StringIO()
+        with torch.no_grad(), contextlib.redirect_stdout(_discard), contextlib.redirect_stderr(_discard):
             output_ids = self.model.generate(
                 **inputs,
                 max_new_tokens=30,

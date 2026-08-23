@@ -1,0 +1,26 @@
+# Streamlit configuration for sneakyReport.
+#
+# fileWatcherType = "none": disables Streamlit's own source-file watcher
+# (the mechanism that auto-reloads the app when a .py file changes on
+# disk). This is unrelated to normal app interactivity (clicking buttons,
+# widgets re-running the script) — that keeps working exactly the same,
+# it's handled over the websocket connection, not the filesystem watcher.
+#
+# Why disabled: on every script rerun, this watcher calls
+# hasattr(module, "__path__") on every already-imported module to figure
+# out what to watch. For the "transformers" module specifically (imported
+# lazily for BLIP captioning — see src/axes/labeling.py), that innocuous
+# hasattr() call triggers its own internal lazy-import machinery, which
+# imports every registered model's image processor class — including
+# several this project never uses (DeepSeek VL, Kimi K2.5, PaddleOCR VL)
+# — each printing a harmless but noisy "undocumented parameter" notice
+# via a plain print() (not Python logging, confirmed by testing) when
+# it's decorated with transformers' own @auto_docstring. None of this is
+# triggered by anything in sneakyReport's own code.
+#
+# Tradeoff: editing a .py file while the app is running will no longer
+# auto-reload it in the browser — stop and re-run run.bat (or
+# `streamlit run app.py`) to pick up changes during active development.
+# Doesn't affect anyone just USING the app (not editing its source).
+[server]
+fileWatcherType = "none"
