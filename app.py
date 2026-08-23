@@ -196,6 +196,22 @@ if "combined_base_axes" not in st.session_state:
     # comparison at all" both degrade to the exact same, already-working
     # single-dataset behavior.
     st.session_state.combined_base_axes = None
+if "compare_base_axes" not in st.session_state:
+    # Set only in the "primary=Custom axis, comparison=Autoextract" case:
+    # the comparison feed clusters on its own (independent of the
+    # primary, which has no auto-detected axes of its own to combine
+    # with) — see _run_full_analysis's own docstring for the full
+    # 4-case matrix this and combined_base_axes together cover.
+    st.session_state.compare_base_axes = None
+if "primary_axis_mode" not in st.session_state:
+    # "auto" (default) or "custom" — independently chosen per dataset
+    # (see compare_axis_mode below), not a single global toggle: e.g.
+    # primary=Custom + comparison=Autoextract means the comparison feed
+    # still gets its own auto-detected axes, just not combined with the
+    # primary (which has none of its own to combine).
+    st.session_state.primary_axis_mode = "auto"
+if "compare_axis_mode" not in st.session_state:
+    st.session_state.compare_axis_mode = "auto"
 if "pdf_report_bytes" not in st.session_state:
     st.session_state.pdf_report_bytes = None
 if "similarity_chain_cache_key" not in st.session_state:
@@ -263,6 +279,42 @@ def run_analysis(path: str, k: int, linkage_method: str) -> None:
         "dataset_name": Path(path).name,
         "k": k,
         "base_axes": axes,  # auto-detected axes only, from the hierarchical tree
+        "embeddings": embeddings,
+        "paths": paths,
+    }
+    st.session_state.viewing_axis = None
+
+
+def run_analysis_custom_mode(path: str) -> None:
+    """
+    "Custom axis" mode's own version of run_analysis — embeddings only,
+    no clustering or captioning (there's nothing to cluster INTO; the
+    user supplies the axes themselves via the "Custom axes" editor
+    instead). base_axes is stored as [] rather than omitted, so
+    full_axes' construction downstream doesn't need special-casing: an
+    empty auto-detected list plus whatever custom axes exist is exactly
+    the axis set this mode is meant to produce.
+    """
+    with st.spinner(
+        "Analyzing images — computing embeddings only, no clustering/captioning needed "
+        "in Custom axis mode."
+    ):
+        try:
+            paths, embeddings, _ = get_embeddings_only(path, embedder=get_embedder())
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            st.session_state.last_result = None
+            st.error(str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            st.session_state.last_result = None
+            st.error(f"Something went wrong while analyzing this folder: {exc}")
+            return
+
+    st.session_state.last_result = {
+        "path": path,
+        "dataset_name": Path(path).name,
+        "k": None,
+        "base_axes": [],
         "embeddings": embeddings,
         "paths": paths,
     }
@@ -866,15 +918,13 @@ def show_axis_images_dialog(
         st.caption("— end of results —")
 
 
-def _load_and_combine_comparison(compare_path: str, primary_path: str, k: int, linkage_method: str) -> bool:
+def _fetch_comparison_embeddings(compare_path: str) -> bool:
     """
-    Fetches the comparison feed's embeddings and combines it with the
-    primary — shared by both entry points: filling in the second path
-    up front (right before "Analyze") and adding a comparison later via
-    "Load comparison feed", so the two flows behave identically instead
-    of drifting apart over time. Returns True on success (result stored
-    in session_state), False if something went wrong (already reported
-    to the user via st.error).
+    Shared first step for every case that involves a comparison feed:
+    fetch its embeddings and store the result — every one of the 4-case
+    matrix's branches needs this regardless of either dataset's mode.
+    Returns True on success, False if something went wrong (already
+    reported via st.error).
     """
     with st.spinner("Loading comparison feed — reading its images..."):
         try:
@@ -888,8 +938,104 @@ def _load_and_combine_comparison(compare_path: str, primary_path: str, k: int, l
         "paths": c_paths,
         "embeddings": c_embeddings,
     }
-    run_combined_analysis(primary_path, compare_path, k, linkage_method)
     return True
+
+
+def _run_full_analysis(
+    path: str, compare_path: str, primary_mode: str, compare_mode: str, k: int, linkage_method: str
+) -> None:
+    """
+    Orchestrates analysis for both datasets according to their
+    INDEPENDENTLY chosen axis-source modes ("auto" | "custom") — the
+    4-case matrix this implements:
+
+        primary=auto,   compare=auto (or no compare)
+            -> today's combined-extraction behavior unchanged: both
+               re-clustered TOGETHER (run_combined_analysis), so a theme
+               present in only one of the two can surface as its own axis.
+        primary=auto,   compare=custom
+            -> only the primary clusters (run_analysis, solo) — the
+               comparison feed is embeddings-only, scored against the
+               primary's own auto-detected axes plus whatever custom axes
+               exist. No combined pipeline involved.
+        primary=custom, compare=auto
+            -> the primary has no auto-detected axes of its own
+               (run_analysis_custom_mode). The comparison feed clusters
+               on ITS OWN instead (run_pipeline directly on compare_path)
+               — a genuinely new case: nothing to combine with, since the
+               primary isn't clustering at all, so the comparison's own
+               axes stand alone, stored separately in
+               st.session_state.compare_base_axes rather than
+               combined_base_axes.
+        primary=custom, compare=custom (or no compare)
+            -> neither dataset clusters at all. Every axis on the radar
+               comes from the shared custom-axes list — see full_axes'
+               own construction below for how base_axes_source picks the
+               right one of these three axis sources (or none, in this
+               last case).
+
+    combined_base_axes and compare_base_axes are both reset at the start
+    of every Analyze click — each case above sets at most one of them,
+    so switching modes between two Analyze clicks can't leave a stale
+    axis source from a previous mode lying around.
+    """
+    if primary_mode == "auto":
+        run_analysis(path, k, linkage_method)
+    else:
+        run_analysis_custom_mode(path)
+
+    st.session_state.combined_base_axes = None
+    st.session_state.compare_base_axes = None
+
+    if not compare_path:
+        st.session_state.compare_result = None
+        return
+
+    if primary_mode == "auto" and compare_mode == "auto":
+        if _fetch_comparison_embeddings(compare_path):
+            run_combined_analysis(path, compare_path, k, linkage_method)
+    elif primary_mode == "custom" and compare_mode == "auto":
+        if _fetch_comparison_embeddings(compare_path):
+            with st.spinner(
+                "Comparison feed has its own axes to detect (Autoextract) — clustering it "
+                "on its own, since the primary has none of its own to combine with."
+            ):
+                st.session_state.compare_base_axes = run_pipeline(
+                    compare_path,
+                    k=k,
+                    linkage_method=linkage_method,
+                    embedder=get_embedder(),
+                    labeler=get_labeler(),
+                )
+    else:
+        # compare_mode == "custom" (primary can be either mode here) --
+        # comparison feed is embeddings-only, no clustering of its own,
+        # scored against whichever axes end up active (primary's own
+        # auto axes, or just the shared custom ones).
+        _fetch_comparison_embeddings(compare_path)
+
+
+def _render_add_custom_axis_input(active_auto_labels: set[str]) -> None:
+    """
+    Shared by both places this needs rendering: before Analyze (when
+    either dataset is in Custom axis mode, and there's no auto-detected
+    axis list yet to check duplicates against — active_auto_labels is
+    empty there) and after Analyze under "Custom axes" (Autoextract
+    mode's own already-existing axes get checked too). Kept as one
+    function so the two call sites can't drift apart over time.
+    """
+    new_axis = st.text_input("Add a custom axis", key="new_axis_input", placeholder="e.g. sky")
+    if st.button("+ Add axis", key="add_axis_button"):
+        label = new_axis.strip()
+        label_lower = label.lower()
+        active_custom_labels = {lbl.lower() for lbl in st.session_state.custom_axis_labels}
+        if not label:
+            st.warning("Type a word or short phrase first.")
+        elif label_lower in active_custom_labels or label_lower in active_auto_labels:
+            st.warning(f"'{label}' is already an active axis.")
+        else:
+            st.session_state.custom_axis_labels.append(label)
+            st.rerun()
 
 
 path = st.text_input(
@@ -897,15 +1043,37 @@ path = st.text_input(
     placeholder=r"C:\Projects\sneakyreport\dataset_samples\sample_01",
     help="Any local folder — subfolders are searched too. Nothing is copied.",
 )
+primary_mode_choice = st.radio(
+    "Axis source",
+    options=["Autoextract", "Custom axis"],
+    index=0 if st.session_state.primary_axis_mode == "auto" else 1,
+    horizontal=True,
+    key="primary_mode_radio",
+    help="Autoextract: clustering + captioning finds themes automatically. Custom axis: "
+    "skips clustering entirely — you define every axis yourself below, scored against "
+    "whatever you add. Takes effect on the next Analyze.",
+)
+st.session_state.primary_axis_mode = "auto" if primary_mode_choice == "Autoextract" else "custom"
+
 compare_path = st.text_input(
     "Second feed folder path (optional)",
     key="compare_path_input",
     placeholder=r"C:\Projects\sneakyreport\dataset_samples\sample_02",
-    help="Fill this in and click Analyze below to re-cluster both datasets together, so a "
-    "theme present in only one of the two (e.g. many horses in the second feed, none at "
-    "all in the first) can still surface as its own axis. Leave it blank to analyze just "
-    "the first dataset — you can always come back and fill it in later.",
+    help="Fill this in and click Analyze below to compare against a second dataset. Leave "
+    "it blank to analyze just the first dataset — you can always come back and fill it "
+    "in later.",
 )
+compare_mode_choice = st.radio(
+    "Axis source (second feed)",
+    options=["Autoextract", "Custom axis"],
+    index=0 if st.session_state.compare_axis_mode == "auto" else 1,
+    horizontal=True,
+    key="compare_mode_radio",
+    help="Chosen independently from the primary's own axis source above — e.g. primary=Custom "
+    "axis with comparison=Autoextract still lets the comparison feed detect its own themes, "
+    "just not combined with the primary (which has none of its own to combine).",
+)
+st.session_state.compare_axis_mode = "auto" if compare_mode_choice == "Autoextract" else "custom"
 
 
 def _remove_comparison() -> None:
@@ -919,6 +1087,7 @@ def _remove_comparison() -> None:
     """
     st.session_state.compare_result = None
     st.session_state.combined_base_axes = None
+    st.session_state.compare_base_axes = None
     st.session_state.compare_path_input = ""
 
 
@@ -933,45 +1102,98 @@ if st.session_state.compare_result is not None:
         f"({len(st.session_state.compare_result['paths'])} images)"
     )
 
-new_k = st.number_input(
-    "Axis number:",
-    min_value=MIN_AXES,
-    max_value=MAX_AXES,
-    value=st.session_state.k,
-    step=1,
-    help=f"Min {MIN_AXES}, max {MAX_AXES}. Type a value directly and press Enter, "
-    "or use the +/- steppers.",
+# k / clustering method only matter to whichever dataset(s) are actually
+# clustering — hidden entirely once NEITHER is: primary=Custom axis with
+# either no comparison feed or a comparison feed that's ALSO Custom axis.
+# In every other combination (including primary=Custom + compare=Auto,
+# where only the comparison feed clusters, on its own) these still apply
+# to whichever side is doing that clustering, so they stay visible.
+any_auto_clustering = st.session_state.primary_axis_mode == "auto" or (
+    bool(compare_path) and st.session_state.compare_axis_mode == "auto"
 )
-if new_k != st.session_state.k:
-    st.session_state.k = new_k
-    if path and st.session_state.last_result and st.session_state.last_result["path"] == path:
-        run_analysis(path, st.session_state.k, st.session_state.linkage_method)
-        if st.session_state.compare_result is not None:
-            run_combined_analysis(
-                path, st.session_state.compare_result["path"], st.session_state.k, st.session_state.linkage_method
+if any_auto_clustering:
+    new_k = st.number_input(
+        "Axis number:",
+        min_value=MIN_AXES,
+        max_value=MAX_AXES,
+        value=st.session_state.k,
+        step=1,
+        help=f"Min {MIN_AXES}, max {MAX_AXES}. Type a value directly and press Enter, "
+        "or use the +/- steppers.",
+    )
+    if new_k != st.session_state.k:
+        st.session_state.k = new_k
+        if path and st.session_state.last_result and st.session_state.last_result["path"] == path:
+            _run_full_analysis(
+                path,
+                compare_path,
+                st.session_state.primary_axis_mode,
+                st.session_state.compare_axis_mode,
+                st.session_state.k,
+                st.session_state.linkage_method,
             )
 
-linkage_choice = st.radio(
-    "Clustering method",
-    options=["ward", "average"],
-    index=["ward", "average"].index(st.session_state.linkage_method),
-    horizontal=True,
-    help=(
-        "'ward' (default) gives balanced, compact clusters. 'average' tends to "
-        "produce one giant cluster plus tiny outlier ones on typical photo "
-        "datasets — mainly here for comparison, not recommended for regular use."
-    ),
+    linkage_choice = st.radio(
+        "Clustering method",
+        options=["ward", "average"],
+        index=["ward", "average"].index(st.session_state.linkage_method),
+        horizontal=True,
+        help=(
+            "'ward' (default) gives balanced, compact clusters. 'average' tends to "
+            "produce one giant cluster plus tiny outlier ones on typical photo "
+            "datasets — mainly here for comparison, not recommended for regular use."
+        ),
+    )
+    if linkage_choice != st.session_state.linkage_method:
+        st.session_state.linkage_method = linkage_choice
+        if path and st.session_state.last_result and st.session_state.last_result["path"] == path:
+            _run_full_analysis(
+                path,
+                compare_path,
+                st.session_state.primary_axis_mode,
+                st.session_state.compare_axis_mode,
+                st.session_state.k,
+                st.session_state.linkage_method,
+            )
+
+# Custom axis mode needs at least one custom axis to mean anything — shown
+# BEFORE Analyze (rather than only after, where it already lives under
+# "Custom axes") whenever either dataset is actually in that mode, so
+# there's something to add before the "at least one" check below can
+# ever pass. The shared custom-axes LIST (not a separate one per
+# dataset) means this single editor covers both — no auto-detected axes
+# exist yet at this point, so there's nothing to check duplicates
+# against besides other custom axes already added.
+#
+# Gated on last_result being None: once a result exists, the full
+# "Custom axes" section further down (with per-axis image counts and
+# thumbnails, not just a bare list) takes over as the one place to
+# manage these — showing BOTH at once would render the same "Add a
+# custom axis" widget twice in one script run (same key), which
+# Streamlit rejects outright.
+needs_custom_axis_editor = st.session_state.last_result is None and (
+    st.session_state.primary_axis_mode == "custom"
+    or (bool(compare_path) and st.session_state.compare_axis_mode == "custom")
 )
-if linkage_choice != st.session_state.linkage_method:
-    st.session_state.linkage_method = linkage_choice
-    if path and st.session_state.last_result and st.session_state.last_result["path"] == path:
-        run_analysis(path, st.session_state.k, st.session_state.linkage_method)
-        if st.session_state.compare_result is not None:
-            run_combined_analysis(
-                path, st.session_state.compare_result["path"], st.session_state.k, st.session_state.linkage_method
+if needs_custom_axis_editor:
+    st.subheader("Custom axes")
+    _render_add_custom_axis_input(active_auto_labels=set())
+    if st.session_state.custom_axis_labels:
+
+        def _remove_pre_analyze_custom_axis(lbl):
+            st.session_state.custom_axis_labels.remove(lbl)
+            st.rerun()
+
+        for _lbl in list(st.session_state.custom_axis_labels):
+            _col_label, _col_remove = st.columns([4, 1])
+            _col_label.caption(f"• {_lbl}")
+            _col_remove.button(
+                "✕", key=f"remove_pre_analyze_{_lbl}", on_click=_remove_pre_analyze_custom_axis, args=(_lbl,)
             )
 
 if st.button("Analyze", type="primary"):
+    _primary_needs_custom = st.session_state.primary_axis_mode == "custom"
+    _compare_needs_custom = bool(compare_path) and st.session_state.compare_axis_mode == "custom"
     if not path and compare_path:
         st.error(
             "To compare two datasets, fill in the first (primary) folder path too — "
@@ -983,37 +1205,54 @@ if st.button("Analyze", type="primary"):
         st.error(f"'{path}' is not a valid folder.")
     elif compare_path and (not Path(compare_path).exists() or not Path(compare_path).is_dir()):
         st.error(f"'{compare_path}' is not a valid folder.")
+    elif (_primary_needs_custom or _compare_needs_custom) and not st.session_state.custom_axis_labels:
+        st.error("Custom axis mode needs at least one custom axis — add one above first.")
     else:
-        run_analysis(path, st.session_state.k, st.session_state.linkage_method)
-        if compare_path:
-            _load_and_combine_comparison(compare_path, path, st.session_state.k, st.session_state.linkage_method)
-        else:
-            # The second path field is empty right now — even if a
-            # comparison was active from before, an empty field is treated
-            # the same as clicking "Remove comparison feed" (same intent),
-            # rather than silently keeping a stale comparison the user
-            # visibly cleared but didn't explicitly remove.
-            st.session_state.compare_result = None
-            st.session_state.combined_base_axes = None
+        _run_full_analysis(
+            path,
+            compare_path,
+            st.session_state.primary_axis_mode,
+            st.session_state.compare_axis_mode,
+            st.session_state.k,
+            st.session_state.linkage_method,
+        )
+        # Forces a fresh script run before continuing, rather than letting
+        # this same pass fall through to the "Custom axes" section further
+        # down: last_result just went from None to a real value MID-run —
+        # continuing on would render the pre-Analyze custom-axis editor
+        # (evaluated earlier in this same pass, while last_result was
+        # still None) AND the post-Analyze one (now that it isn't),
+        # both with the same widget key, which Streamlit rejects. A fresh
+        # run sees last_result already set from the start, so only the
+        # post-Analyze editor renders.
+        st.rerun()
 
 result = st.session_state.last_result
 if result is not None:
     embedder = get_embedder()
     compare_result = st.session_state.compare_result
 
-    # Auto-detected base: when a comparison feed is active AND has
-    # already been combined at the current k/linkage_method, use the
-    # COMBINED axes (which can include a theme present in only ONE of
-    # the two datasets, e.g. many horses in the second feed and none at
-    # all in the first) — otherwise fall back to the primary's own
-    # solo-dataset axes, exactly as before this feature existed. Falls
-    # back automatically the moment the comparison feed is removed (see
-    # "Remove comparison feed" resetting combined_base_axes to None).
-    base_axes_source = (
-        st.session_state.combined_base_axes
-        if compare_result is not None and st.session_state.combined_base_axes is not None
-        else result["base_axes"]
-    )
+    # Auto-detected base — three possible sources, per the 4-case mode
+    # matrix (see _run_full_analysis's own docstring for the full table):
+    #   - combined_base_axes: BOTH datasets are Autoextract, and combined
+    #     re-clustering has already run at the current k/linkage_method —
+    #     can include a theme present in only ONE of the two datasets.
+    #   - compare_base_axes: primary=Custom axis, comparison=Autoextract —
+    #     the comparison feed clustered on its own, since the primary has
+    #     nothing of its own to combine with.
+    #   - result["base_axes"]: every other case — primary=Autoextract's
+    #     own solo-dataset axes (comparison is Custom axis, or there's no
+    #     comparison at all), OR primary=Custom axis with no auto-detected
+    #     axes anywhere (correctly [] in that case, from
+    #     run_analysis_custom_mode). Falls back here automatically the
+    #     moment a comparison feed is removed (see "Remove comparison
+    #     feed" resetting both of the other two to None).
+    if compare_result is not None and st.session_state.combined_base_axes is not None:
+        base_axes_source = st.session_state.combined_base_axes
+    elif compare_result is not None and st.session_state.compare_base_axes is not None:
+        base_axes_source = st.session_state.compare_base_axes
+    else:
+        base_axes_source = result["base_axes"]
 
     # Build the full active axis set: auto-detected (minus any the user
     # excluded) + custom, in that order.
@@ -1364,32 +1603,12 @@ if result is not None:
                 st.rerun()
 
     st.subheader("Custom axes")
-    new_axis = st.text_input("Add a custom axis", key="new_axis_input", placeholder="e.g. sky")
-    if st.button("+ Add axis"):
-        label = new_axis.strip()
-        label_lower = label.lower()
-        # Case-insensitive, and only checked against currently ACTIVE
-        # axes — an auto-detected axis you've already removed via "Remove
-        # axis" no longer blocks reusing its name here; once you've
-        # excluded it, its slot is free to reclaim as a custom axis. A
-        # custom axis behaves identically to an auto-detected one for
-        # scoring/image attribution either way (same get_dominant_labels
-        # competition), so there's no meaningful difference to protect
-        # against here beyond avoiding two simultaneously-active axes
-        # with the same name.
-        active_auto_labels = {
-            a.label.lower()
-            for a in base_axes_source
-            if a.label not in st.session_state.excluded_axis_labels
-        }
-        active_custom_labels = {lbl.lower() for lbl in st.session_state.custom_axis_labels}
-        if not label:
-            st.warning("Type a word or short phrase first.")
-        elif label_lower in active_custom_labels or label_lower in active_auto_labels:
-            st.warning(f"'{label}' is already an active axis.")
-        else:
-            st.session_state.custom_axis_labels.append(label)
-            st.rerun()
+    _active_auto_labels_for_dup_check = {
+        a.label.lower()
+        for a in base_axes_source
+        if a.label not in st.session_state.excluded_axis_labels
+    }
+    _render_add_custom_axis_input(_active_auto_labels_for_dup_check)
 
     if st.session_state.custom_axis_labels:
 

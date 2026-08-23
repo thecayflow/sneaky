@@ -62,6 +62,7 @@ from reportlab.platypus import (
 )
 
 from src.report.metrics import DatasetOverviewMetrics
+from src.scoring.scoring import OTHER_LABEL
 
 # ─── Industry design-system tokens ──────────────────────────────────────
 # Mirrors theme.json / styles.css from the Industry design system: a mono
@@ -696,7 +697,8 @@ def _render_bar_chart(
                 dataset_names_seen.append((seg_name, seg_color))
         legend_handles = [Patch(facecolor=c, label=n) for n, c in dataset_names_seen]
     else:
-        ax.barh(labels, values, color=MPL_ACCENT, height=0.62)
+        colors = [MPL_NEUTRAL_600 if lbl == OTHER_LABEL else MPL_ACCENT for lbl in labels]
+        ax.barh(labels, values, color=colors, height=0.62)
 
     max_val = max(values) if values else 1
     for i, value in enumerate(values):
@@ -904,28 +906,41 @@ def _render_treemap(
                 legend_handles = [Patch(facecolor=p["color"], label=p["name"]) for p in breakdown]
 
             # Same "label (pct%)" single-line approach as the no-breakdown
-            # case, applied per sub-box — the axis name used to sit once,
-            # shared, above the whole box, with each sub-box's percentage
-            # positioned independently below it; that shared-label
-            # approach is what let a small sub-box collide with it. Each
-            # sub-box now carries its own self-contained text instead: the
-            # FIRST (largest, by construction — breakdown is built primary
-            # dataset first) gets "label (pct%)"; the rest just "(pct%)",
-            # since they're already visually grouped under the same axis
-            # rectangle. Measured for real per sub-box, same as before —
-            # a sub-box too small for even its own short text just gets
-            # nothing, rather than colliding with anything else.
-            for i, (sub_x, sub_y, sub_w, sub_h, sub_pct) in enumerate(sub_boxes):
-                text = f"{label} ({sub_pct:.1f}%)" if i == 0 else f"({sub_pct:.1f}%)"
-                kwargs = {"ha": "center", "va": "center", "color": "white", **_mpl_font("bold" if i == 0 else "regular")}
-                fontsize = 8 if i == 0 else 7
+            # case, applied per sub-box, with the axis name repeated on
+            # EVERY sub-box rather than just the first — a first pass only
+            # labeled the first (largest) sub-box, leaving the rest with
+            # just a bare percentage, relying on the sub-boxes' visual
+            # adjacency to imply they're the same axis. That reads fine
+            # with many small axes packed side by side, but falls apart
+            # when there's only one or two axes total: an unlabeled
+            # sub-box spanning most of the treemap doesn't visually read
+            # as "part of the same box" — it reads as its own,
+            # unidentified category, which is misleading. The redundancy
+            # cost with many small breakdown axes is minor next to never
+            # showing an unlabeled box. Measured for real per sub-box,
+            # same as before — a sub-box too small for even its own short
+            # text just gets nothing, rather than colliding with anything
+            # else.
+            for sub_x, sub_y, sub_w, sub_h, sub_pct in sub_boxes:
+                text = f"{label} ({sub_pct:.1f}%)"
+                kwargs = {"ha": "center", "va": "center", "color": "white", **_mpl_font("bold")}
+                fontsize = 8
                 if sub_w > 18 and sub_h > 12 and _label_fits(text, fontsize, kwargs, sub_w, sub_h):
                     ax.text(sub_x + sub_w / 2, sub_y + sub_h / 2, text, fontsize=fontsize, **kwargs)
         else:
-            norm = value / max_val
-            color = _lerp_hex(MPL_ACCENT_200, MPL_ACCENT_800, 0.15 + 0.85 * norm)
+            if label == OTHER_LABEL:
+                # Fixed neutral color, not part of the size-based
+                # interpolation the real axes use below — Other isn't a
+                # semantic theme, it's the absence of one, and shouldn't
+                # visually read as "just another axis, happens to be
+                # this size."
+                color = MPL_NEUTRAL_600
+                text_color = "white"
+            else:
+                norm = value / max_val
+                color = _lerp_hex(MPL_ACCENT_200, MPL_ACCENT_800, 0.15 + 0.85 * norm)
+                text_color = "white" if norm > 0.45 else MPL_TEXT
             ax.add_patch(plt.Rectangle((rx, ry), rw, rh, facecolor=color, edgecolor=MPL_BG, linewidth=2))
-            text_color = "white" if norm > 0.45 else MPL_TEXT
 
             # Single line "label (pct%)" instead of two stacked lines —
             # two independently-positioned lines anchored to the same
@@ -1727,7 +1742,19 @@ def generate_pdf_report(
     # and so it's safe to reference at the treemap's call site even in
     # the edge case where the bar chart's own "if axis_sizes:" guard
     # further down might not fire.
-    combined_axis_sizes: dict[str, int] = overview.axis_sizes
+    #
+    # Includes an explicit "Other" entry (a new dict, not a reference to
+    # overview.axis_sizes itself — that field's own contract elsewhere is
+    # "semantic axes only," e.g. for largest/smallest-cluster and
+    # n_semantic_axes, where Other competing as if it were a real theme
+    # would be wrong): with 10 auto-detected axes, Other was usually a
+    # small enough slice that omitting it from these two charts didn't
+    # meaningfully mislead. With as few as one Custom axis mode axis, it
+    # can be the majority of the dataset — omitting it here would give a
+    # genuinely false picture of the whole, not just a minor gap.
+    combined_axis_sizes: dict[str, int] = dict(overview.axis_sizes)
+    if overview.unclassified_count:
+        combined_axis_sizes[OTHER_LABEL] = overview.unclassified_count
     axis_sizes_breakdown: dict[str, list[dict]] | None = None
     # Combined totals/percentages — computed from underlying COUNTS, not
     # by averaging the two datasets' own percentages (averaging would
@@ -1758,6 +1785,17 @@ def generate_pdf_report(
             ]
             for lbl in all_axis_labels
         }
+        other_combined_count = overview.unclassified_count + overview_compare.unclassified_count
+        if other_combined_count:
+            combined_axis_sizes[OTHER_LABEL] = other_combined_count
+            axis_sizes_breakdown[OTHER_LABEL] = [
+                {"value": overview.unclassified_count, "color": MPL_ACCENT, "name": dataset_name},
+                {
+                    "value": overview_compare.unclassified_count,
+                    "color": MPL_ACCENT_COMPARE,
+                    "name": compare_dataset_name,
+                },
+            ]
         combined_total = overview.total_images + overview_compare.total_images
         combined_unclassified_pct = (
             (overview.unclassified_count + overview_compare.unclassified_count) / combined_total * 100
@@ -1899,10 +1937,7 @@ def generate_pdf_report(
     story.append(Spacer(1, SP_4))
     # --- Axis size bar chart -----------------------------------------
     if overview.axis_sizes or (overview_compare and overview_compare.axis_sizes):
-        if comparing:
-            bar_buf = _render_bar_chart(combined_axis_sizes, axis_sizes_breakdown)
-        else:
-            bar_buf = _render_bar_chart(overview.axis_sizes)
+        bar_buf = _render_bar_chart(combined_axis_sizes, axis_sizes_breakdown)
         story.append(Spacer(1, SP_2))
         story.append(_Blueprint(_rl_image_for_width(bar_buf, portrait_w - 26), pad=6, margin=7))
 
@@ -2117,7 +2152,7 @@ def generate_pdf_report(
         _, header_h = diversity_header.wrap(landscape_w, landscape_h)
         story.append(diversity_header)
         story.append(Spacer(1, SP_4))
-        treemap_buf = _render_treemap(combined_axis_sizes, axis_sizes_breakdown if comparing else None)
+        treemap_buf = _render_treemap(combined_axis_sizes, axis_sizes_breakdown)
         treemap_frame = _Blueprint(_rl_image_for_width(treemap_buf, landscape_w - 26), pad=6, margin=7)
         remaining_h = landscape_h - header_h - SP_4
         treemap_frame.wrap(landscape_w, remaining_h)
