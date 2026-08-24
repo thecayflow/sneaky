@@ -453,6 +453,26 @@ def clear_all(root_path: str | Path) -> None:
     logger.info("Cleared ALL cache for %s", root_path)
 
 
+def clear_all_pair_caches() -> None:
+    """
+    Delete every combined-axes pair cache (see _pair_cache_dir) in one go
+    — unlike single-dataset caches, a pair cache directory has no
+    meta.json of its own with a human-readable name (it's keyed by a
+    hash of BOTH root paths, and nothing today records what those two
+    paths were once the entry exists), so there's no reasonable way to
+    list or clear individual pairs by name — this clears all of them at
+    once instead. Each pair's cache is rebuilt automatically the next
+    time that same pair is analyzed together again.
+    """
+    import shutil
+
+    pairs_dir = CACHE_ROOT / "pairs"
+    if pairs_dir.exists():
+        shutil.rmtree(pairs_dir)
+        pairs_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Cleared all combined-axes pair caches")
+
+
 def get_cache_info(root_path: str | Path) -> list[tuple[str, int]]:
     """List (filename, size_in_bytes) for every file currently cached for this dataset."""
     cache_dir = _dataset_cache_dir(root_path)
@@ -460,6 +480,60 @@ def get_cache_info(root_path: str | Path) -> list[tuple[str, int]]:
         ((f.name, f.stat().st_size) for f in cache_dir.iterdir() if f.is_file()),
         key=lambda item: item[0],
     )
+
+
+@dataclass
+class CachedDatasetInfo:
+    root_path: str
+    n_images: int
+    cached_at: str
+    total_size_bytes: int
+
+
+def list_cached_datasets() -> list[CachedDatasetInfo]:
+    """
+    Every dataset currently in the cache, discovered by scanning
+    CACHE_ROOT's own subdirectories (each one a per-dataset cache, keyed
+    by a hash of its root_path — not the root_path itself) and reading
+    each one's meta.json to recover the human-readable original path.
+    Lets the UI offer cache management WITHOUT the user needing to
+    already know or type a specific dataset path first — e.g. right
+    after starting the app, before analyzing anything this session.
+
+    The special "pairs/" subdirectory (combined-axes cache for dataset
+    PAIRS analyzed together, not a single dataset — see
+    _pair_cache_dir) is skipped here; it has no meta.json of its own in
+    this same shape, and clearing it isn't part of per-dataset cache
+    management.
+
+    A subdirectory with no meta.json (shouldn't normally happen — it's
+    always written alongside embeddings.npz — but harmless if it does,
+    e.g. an interrupted first-ever save) is skipped rather than raising,
+    since there's nothing meaningful to show for it.
+    """
+    if not CACHE_ROOT.exists():
+        return []
+    results = []
+    for entry in CACHE_ROOT.iterdir():
+        if not entry.is_dir() or entry.name == "pairs":
+            continue
+        meta_file = entry / "meta.json"
+        if not meta_file.exists():
+            continue
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        total_size = sum(f.stat().st_size for f in entry.iterdir() if f.is_file())
+        results.append(
+            CachedDatasetInfo(
+                root_path=meta.get("root_path", str(entry)),
+                n_images=meta.get("n_images", 0),
+                cached_at=meta.get("cached_at", ""),
+                total_size_bytes=total_size,
+            )
+        )
+    return sorted(results, key=lambda d: d.cached_at, reverse=True)
 
 
 # ---------------------------------------------------------------------------

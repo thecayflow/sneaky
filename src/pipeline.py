@@ -15,6 +15,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
@@ -44,7 +45,12 @@ def _current_mtimes(paths: list[Path]) -> dict[str, float]:
     return mtimes
 
 
-def _update_embeddings_incrementally(root_path: str, recursive: bool, embedder: ClipEmbedder | None = None):
+def _update_embeddings_incrementally(
+    root_path: str,
+    recursive: bool,
+    embedder: ClipEmbedder | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+):
     """
     Scan the folder fresh and reconcile against whatever is cached:
       - no cache at all -> embed everything (first run for this folder)
@@ -70,6 +76,11 @@ def _update_embeddings_incrementally(root_path: str, recursive: bool, embedder: 
     None (the default) instantiates one locally, exactly as before — for
     any non-Streamlit caller (scripts, tests).
 
+    on_progress: optional (done, total) callback, forwarded as-is to
+    ClipEmbedder.embed_images — see its own docstring for the throttling
+    behavior. Only fires when there are actually images to embed (a full
+    cache hit never calls it).
+
     Returns (paths, embeddings, skipped).
     """
     scan = scan_folder(root_path, recursive=recursive)
@@ -81,7 +92,7 @@ def _update_embeddings_incrementally(root_path: str, recursive: bool, embedder: 
     if cached is None:
         logger.info("No cache found — embedding all %d images", len(scan.valid_images))
         active_embedder = embedder if embedder is not None else ClipEmbedder()
-        result = active_embedder.embed_images(scan.valid_images, batch_size=32)
+        result = active_embedder.embed_images(scan.valid_images, batch_size=32, on_progress=on_progress)
         paths, embeddings = result.paths, result.embeddings
         skipped = scan.skipped_files + result.failed
         cache.save_scan_and_embeddings(root_path, paths, embeddings, skipped, mtimes=_current_mtimes(paths))
@@ -138,7 +149,7 @@ def _update_embeddings_incrementally(root_path: str, recursive: bool, embedder: 
 
     if paths_to_embed:
         active_embedder = embedder if embedder is not None else ClipEmbedder()
-        result = active_embedder.embed_images(paths_to_embed, batch_size=32)
+        result = active_embedder.embed_images(paths_to_embed, batch_size=32, on_progress=on_progress)
         new_paths, new_embeddings, new_failed = result.paths, result.embeddings, result.failed
     else:
         new_paths, new_failed = [], []
@@ -165,7 +176,12 @@ def _update_embeddings_incrementally(root_path: str, recursive: bool, embedder: 
     return paths, embeddings, skipped
 
 
-def get_embeddings_only(root_path: str, recursive: bool = True, embedder: ClipEmbedder | None = None):
+def get_embeddings_only(
+    root_path: str,
+    recursive: bool = True,
+    embedder: ClipEmbedder | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+):
     """
     Public entry point for a "lightweight" pipeline run: scan + reconcile
     embeddings only, no clustering or labeling. This is what a comparison
@@ -175,11 +191,12 @@ def get_embeddings_only(root_path: str, recursive: bool = True, embedder: ClipEm
 
     embedder: see _update_embeddings_incrementally — pass a cached
     instance to avoid reloading CLIP's weights.
+    on_progress: see _update_embeddings_incrementally — forwarded as-is.
 
     Returns (paths, embeddings, skipped) — same shape as
     cache.load_scan_and_embeddings.
     """
-    return _update_embeddings_incrementally(root_path, recursive, embedder=embedder)
+    return _update_embeddings_incrementally(root_path, recursive, embedder=embedder, on_progress=on_progress)
 
 
 def run_pipeline(
@@ -189,6 +206,8 @@ def run_pipeline(
     linkage_method: str = "ward",
     embedder: ClipEmbedder | None = None,
     labeler: ClusterLabeler | None = None,
+    on_embed_progress: Callable[[int, int], None] | None = None,
+    on_caption_progress: Callable[[int, int], None] | None = None,
 ) -> list[cache.AxisRecord]:
     """
     Full pipeline for one dataset folder, using cache wherever possible.
@@ -207,10 +226,19 @@ def run_pipeline(
     genuinely different work), but the underlying model weights only get
     loaded once per session either way. None (the default) instantiates
     locally, exactly as before — for any non-Streamlit caller.
+
+    on_embed_progress / on_caption_progress: optional (done, total)
+    callbacks, forwarded as-is to ClipEmbedder.embed_images and
+    ClusterLabeler.label_clusters respectively — see their own docstrings.
+    Each only fires during the step it corresponds to, and only when that
+    step actually has work to do (a cache hit skips the step entirely, so
+    its callback simply never gets called that run).
     """
     # Step 1: scan + reconcile embeddings — the expensive step, but now
     # incremental: only genuinely new images get embedded.
-    paths, embeddings, skipped = _update_embeddings_incrementally(root_path, recursive, embedder=embedder)
+    paths, embeddings, skipped = _update_embeddings_incrementally(
+        root_path, recursive, embedder=embedder, on_progress=on_embed_progress
+    )
 
     # Step 2: hierarchical tree — cached independently of k (but per
     # linkage_method), since the same tree is reused no matter how many
@@ -239,7 +267,7 @@ def run_pipeline(
 
     logger.info("No cached labels for method=%s, k=%d — running captioning", linkage_method, k)
     active_labeler = labeler if labeler is not None else ClusterLabeler()
-    cluster_labels = active_labeler.label_clusters(clusters, embeddings, paths)
+    cluster_labels = active_labeler.label_clusters(clusters, embeddings, paths, on_progress=on_caption_progress)
 
     clusters_by_id = {c.cluster_id: c for c in clusters}
     records = [
@@ -266,6 +294,9 @@ def run_combined_pipeline(
     linkage_method: str = "ward",
     embedder: ClipEmbedder | None = None,
     labeler: ClusterLabeler | None = None,
+    on_embed_progress_a: Callable[[int, int], None] | None = None,
+    on_embed_progress_b: Callable[[int, int], None] | None = None,
+    on_caption_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[list[cache.AxisRecord], list[Path], np.ndarray, list[int]]:
     """
     Full pipeline for TWO dataset folders analyzed TOGETHER: embeddings
@@ -303,15 +334,22 @@ def run_combined_pipeline(
     already-cached combined tree/axes for this pair, since the path set
     itself is unchanged. Rare in practice; noted rather than silently
     left unhandled.
+
+    on_embed_progress_a / on_embed_progress_b / on_caption_progress:
+    optional (done, total) callbacks — see run_pipeline's own docstring
+    for the general contract. Two separate embedding callbacks (rather
+    than one shared) since there are genuinely two independent embedding
+    passes here (one per dataset) that a caller may want to report on
+    distinctly (e.g. updating a progress bar's label between them).
     """
     # Step 1: each dataset's own embeddings — cheap if already cached,
     # incremental otherwise. No duplicated logic: this is the exact same
     # per-dataset caching the single-dataset pipeline already uses.
     paths_a, embeddings_a, skipped_a = _update_embeddings_incrementally(
-        root_path_a, recursive, embedder=embedder
+        root_path_a, recursive, embedder=embedder, on_progress=on_embed_progress_a
     )
     paths_b, embeddings_b, skipped_b = _update_embeddings_incrementally(
-        root_path_b, recursive, embedder=embedder
+        root_path_b, recursive, embedder=embedder, on_progress=on_embed_progress_b
     )
 
     combined_paths = list(paths_a) + list(paths_b)
@@ -360,7 +398,9 @@ def run_combined_pipeline(
         linkage_method, k,
     )
     active_labeler = labeler if labeler is not None else ClusterLabeler()
-    cluster_labels = active_labeler.label_clusters(clusters, combined_embeddings, combined_paths)
+    cluster_labels = active_labeler.label_clusters(
+        clusters, combined_embeddings, combined_paths, on_progress=on_caption_progress
+    )
 
     clusters_by_id = {c.cluster_id: c for c in clusters}
     records = [

@@ -148,6 +148,25 @@ def get_labeler() -> ClusterLabeler:
     return ClusterLabeler()
 
 
+def _make_progress_callback(placeholder, label: str):
+    """
+    Returns a (done, total) -> None callback that renders a progress bar
+    into `placeholder`, labeled with `label` — the bridge between
+    ClipEmbedder.embed_images'/ClusterLabeler.label_clusters' own
+    on_progress callbacks (plain (done, total) numbers, no Streamlit
+    knowledge) and an actual visible st.progress bar. Passing the SAME
+    placeholder again for a later phase (e.g. embeddings, then
+    captioning) reuses that one bar in place — updating its label as the
+    phase changes — instead of stacking a new bar underneath the old one.
+    """
+
+    def _callback(done: int, total: int) -> None:
+        fraction = min(1.0, done / total) if total else 1.0
+        placeholder.progress(fraction, text=f"{label}: {done:,} / {total:,}")
+
+    return _callback
+
+
 def _image_to_base64_thumb(path: Path, max_size: int = SIMILARITY_CHAIN_THUMB_SIZE) -> str | None:
     """Small JPEG thumbnail, base64-encoded, for embedding directly in raw HTML
     (a local file:// path won't reliably load in an <img> tag on a page served
@@ -212,6 +231,12 @@ if "primary_axis_mode" not in st.session_state:
     st.session_state.primary_axis_mode = "auto"
 if "compare_axis_mode" not in st.session_state:
     st.session_state.compare_axis_mode = "auto"
+if "pending_orphaned_axes_prompt" not in st.session_state:
+    # True right after both datasets have just become Autoextract-only,
+    # while custom axes added for the OTHER reason (as a Custom axis
+    # mode dataset's only source of axes) are still sitting around —
+    # see the prompt trigger logic further down for the full reasoning.
+    st.session_state.pending_orphaned_axes_prompt = False
 if "pdf_report_bytes" not in st.session_state:
     st.session_state.pdf_report_bytes = None
 if "similarity_chain_cache_key" not in st.session_state:
@@ -256,9 +281,16 @@ def run_analysis(path: str, k: int, linkage_method: str) -> None:
     )
 
     with st.spinner(spinner_msg):
+        progress_placeholder = st.empty()
         try:
             axes = run_pipeline(
-                path, k=k, linkage_method=linkage_method, embedder=get_embedder(), labeler=get_labeler()
+                path,
+                k=k,
+                linkage_method=linkage_method,
+                embedder=get_embedder(),
+                labeler=get_labeler(),
+                on_embed_progress=_make_progress_callback(progress_placeholder, "Embedding images"),
+                on_caption_progress=_make_progress_callback(progress_placeholder, "Captioning themes"),
             )
             loaded = cache.load_scan_and_embeddings(path)
             if loaded is None:
@@ -273,6 +305,8 @@ def run_analysis(path: str, k: int, linkage_method: str) -> None:
             st.session_state.last_result = None
             st.error(f"Something went wrong while analyzing this folder: {exc}")
             return
+        finally:
+            progress_placeholder.empty()
 
     st.session_state.last_result = {
         "path": path,
@@ -299,8 +333,13 @@ def run_analysis_custom_mode(path: str) -> None:
         "Analyzing images — computing embeddings only, no clustering/captioning needed "
         "in Custom axis mode."
     ):
+        progress_placeholder = st.empty()
         try:
-            paths, embeddings, _ = get_embeddings_only(path, embedder=get_embedder())
+            paths, embeddings, _ = get_embeddings_only(
+                path,
+                embedder=get_embedder(),
+                on_progress=_make_progress_callback(progress_placeholder, "Embedding images"),
+            )
         except (FileNotFoundError, NotADirectoryError) as exc:
             st.session_state.last_result = None
             st.error(str(exc))
@@ -309,6 +348,8 @@ def run_analysis_custom_mode(path: str) -> None:
             st.session_state.last_result = None
             st.error(f"Something went wrong while analyzing this folder: {exc}")
             return
+        finally:
+            progress_placeholder.empty()
 
     st.session_state.last_result = {
         "path": path,
@@ -350,6 +391,7 @@ def run_combined_analysis(primary_path: str, compare_path: str, k: int, linkage_
         "much faster."
     )
     with st.spinner(spinner_msg):
+        progress_placeholder = st.empty()
         try:
             records, _combined_paths, _combined_embeddings, _origin = run_combined_pipeline(
                 primary_path,
@@ -358,10 +400,19 @@ def run_combined_analysis(primary_path: str, compare_path: str, k: int, linkage_
                 linkage_method=linkage_method,
                 embedder=get_embedder(),
                 labeler=get_labeler(),
+                on_embed_progress_a=_make_progress_callback(
+                    progress_placeholder, f"Embedding {Path(primary_path).name}"
+                ),
+                on_embed_progress_b=_make_progress_callback(
+                    progress_placeholder, f"Embedding {Path(compare_path).name}"
+                ),
+                on_caption_progress=_make_progress_callback(progress_placeholder, "Captioning themes"),
             )
         except Exception as exc:  # noqa: BLE001
             st.error(f"Something went wrong combining both feeds: {exc}")
             return
+        finally:
+            progress_placeholder.empty()
     st.session_state.combined_base_axes = records
 
 
@@ -927,11 +978,18 @@ def _fetch_comparison_embeddings(compare_path: str) -> bool:
     reported via st.error).
     """
     with st.spinner("Loading comparison feed — reading its images..."):
+        progress_placeholder = st.empty()
         try:
-            c_paths, c_embeddings, _ = get_embeddings_only(compare_path, embedder=get_embedder())
+            c_paths, c_embeddings, _ = get_embeddings_only(
+                compare_path,
+                embedder=get_embedder(),
+                on_progress=_make_progress_callback(progress_placeholder, "Embedding images"),
+            )
         except Exception as exc:  # noqa: BLE001
             st.error(f"Something went wrong loading the second feed: {exc}")
             return False
+        finally:
+            progress_placeholder.empty()
     st.session_state.compare_result = {
         "path": compare_path,
         "dataset_name": Path(compare_path).name,
@@ -1000,13 +1058,28 @@ def _run_full_analysis(
                 "Comparison feed has its own axes to detect (Autoextract) — clustering it "
                 "on its own, since the primary has none of its own to combine with."
             ):
-                st.session_state.compare_base_axes = run_pipeline(
-                    compare_path,
-                    k=k,
-                    linkage_method=linkage_method,
-                    embedder=get_embedder(),
-                    labeler=get_labeler(),
-                )
+                progress_placeholder = st.empty()
+                try:
+                    st.session_state.compare_base_axes = run_pipeline(
+                        compare_path,
+                        k=k,
+                        linkage_method=linkage_method,
+                        embedder=get_embedder(),
+                        labeler=get_labeler(),
+                        # Embeddings were already fetched just above by
+                        # _fetch_comparison_embeddings, so this callback
+                        # realistically never fires (cache hit) — passed
+                        # anyway for consistency with every other call
+                        # site, in case that ever changes.
+                        on_embed_progress=_make_progress_callback(
+                            progress_placeholder, "Embedding images"
+                        ),
+                        on_caption_progress=_make_progress_callback(
+                            progress_placeholder, "Captioning themes"
+                        ),
+                    )
+                finally:
+                    progress_placeholder.empty()
     else:
         # compare_mode == "custom" (primary can be either mode here) --
         # comparison feed is embeddings-only, no clustering of its own,
@@ -1038,6 +1111,41 @@ def _render_add_custom_axis_input(active_auto_labels: set[str]) -> None:
             st.rerun()
 
 
+@st.dialog("Keep your custom axes?")
+def _prompt_orphaned_custom_axes() -> None:
+    """
+    Modal — see the trigger site (right after both axis-source radio
+    buttons) for the full reasoning on why this asks instead of silently
+    keeping or auto-clearing. IMPORTANT: this function is only ever
+    CALLED once, from that one trigger site, guarded by the
+    pending_orphaned_axes_prompt flag — it must never be invoked like a
+    plain function anywhere else. An @st.dialog-decorated function
+    treated as an ordinary function elsewhere is exactly the mistake
+    documented in DEVELOPMENT.md's own "misplaced @st.dialog decorator"
+    story, and produced confusing symptoms that took several rounds to
+    trace back then.
+    """
+    axis_list = ", ".join(f'"{lbl}"' for lbl in st.session_state.custom_axis_labels)
+    st.write(
+        f"Both datasets are now set to Autoextract, but you still have "
+        f"{len(st.session_state.custom_axis_labels)} custom axis(es) defined: {axis_list}."
+    )
+    st.write(
+        "Keep them as an extra layer on top of Autoextract's own detected themes, "
+        "or clear them now that neither dataset needs them to have axes at all?"
+    )
+    col_keep, col_clear = st.columns(2)
+    with col_keep:
+        if st.button("Keep them", type="primary"):
+            st.session_state.pending_orphaned_axes_prompt = False
+            st.rerun()
+    with col_clear:
+        if st.button("Clear them"):
+            st.session_state.custom_axis_labels = []
+            st.session_state.pending_orphaned_axes_prompt = False
+            st.rerun()
+
+
 path = st.text_input(
     "Dataset folder path",
     placeholder=r"C:\Projects\sneakyreport\dataset_samples\sample_01",
@@ -1053,7 +1161,9 @@ primary_mode_choice = st.radio(
     "skips clustering entirely — you define every axis yourself below, scored against "
     "whatever you add. Takes effect on the next Analyze.",
 )
-st.session_state.primary_axis_mode = "auto" if primary_mode_choice == "Autoextract" else "custom"
+_old_primary_mode = st.session_state.primary_axis_mode
+_new_primary_mode = "auto" if primary_mode_choice == "Autoextract" else "custom"
+st.session_state.primary_axis_mode = _new_primary_mode
 
 compare_path = st.text_input(
     "Second feed folder path (optional)",
@@ -1073,7 +1183,39 @@ compare_mode_choice = st.radio(
     "axis with comparison=Autoextract still lets the comparison feed detect its own themes, "
     "just not combined with the primary (which has none of its own to combine).",
 )
-st.session_state.compare_axis_mode = "auto" if compare_mode_choice == "Autoextract" else "custom"
+_old_compare_mode = st.session_state.compare_axis_mode
+_new_compare_mode = "auto" if compare_mode_choice == "Autoextract" else "custom"
+st.session_state.compare_axis_mode = _new_compare_mode
+
+# A custom axis (e.g. "sky") isn't tied to the toggle above by nature —
+# it's always been an ADDITIVE layer on top of whatever Autoextract
+# finds, from long before this toggle existed, and that use case should
+# keep working: someone deliberately adding a custom axis alongside
+# Autoextract expects it to stick around. But the toggle also introduced
+# a SECOND reason a custom axis might exist — a dataset forced into
+# Custom axis mode has no axes without one. Switching that dataset back
+# to Autoextract can leave a custom axis that was only ever there for
+# that second reason looking like leftover clutter, without any way for
+# the code to tell the two reasons apart on its own. Rather than
+# guessing (auto-clearing risks deleting an intentional axis someone
+# added on purpose; never clearing leaves genuine leftovers), ask —
+# but only right at the moment BOTH datasets have just become
+# Autoextract-only (no longer NEED a custom axis to have any axes at
+# all), and only if there's something to ask about.
+_primary_just_left_custom = _old_primary_mode == "custom" and _new_primary_mode == "auto"
+_compare_just_left_custom = _old_compare_mode == "custom" and _new_compare_mode == "auto"
+_now_neither_needs_custom = _new_primary_mode == "auto" and (
+    _new_compare_mode == "auto" or not compare_path
+)
+if (
+    (_primary_just_left_custom or _compare_just_left_custom)
+    and _now_neither_needs_custom
+    and st.session_state.custom_axis_labels
+):
+    st.session_state.pending_orphaned_axes_prompt = True
+
+if st.session_state.pending_orphaned_axes_prompt:
+    _prompt_orphaned_custom_axes()
 
 
 def _remove_comparison() -> None:
@@ -2266,43 +2408,117 @@ if result is not None:
             mime="application/pdf",
         )
 
+st.divider()
+with st.expander("Cache management"):
     if path and Path(path).exists() and Path(path).is_dir():
-        with st.expander("Cache management"):
-            cache_info = cache.get_cache_info(path)
-            if not cache_info:
-                st.caption("Nothing cached for this folder yet.")
-            else:
-                total_size = sum(size for _, size in cache_info)
-                st.caption(
-                    f"{len(cache_info)} file(s) cached, {total_size / 1_048_576:.1f} MB total."
-                )
-                file_list_md = "\n".join(
-                    f"- `{filename}` — {size / 1024:.0f} KB" for filename, size in cache_info
-                )
-                st.markdown(file_list_md)
+        st.markdown("**Current dataset**")
+        cache_info = cache.get_cache_info(path)
+        if not cache_info:
+            st.caption("Nothing cached for this folder yet.")
+        else:
+            total_size = sum(size for _, size in cache_info)
+            st.caption(
+                f"{len(cache_info)} file(s) cached, {total_size / 1_048_576:.1f} MB total."
+            )
+            file_list_md = "\n".join(
+                f"- `{filename}` — {size / 1024:.0f} KB" for filename, size in cache_info
+            )
+            st.markdown(file_list_md)
 
-            cc1, cc2, cc3 = st.columns(3)
-            with cc1:
-                if st.button(
-                    "Clear clustering & projections",
-                    help="Keeps embeddings — clears trees, axes, t-SNE, UMAP, global order.",
-                ):
-                    cache.invalidate_tree_and_axes(path)
-                    st.session_state.last_result = None
-                    st.success("Cleared. Re-analyze to recompute.")
-            with cc2:
-                if st.button(
-                    "Clear visual similarity cache",
-                    help="Clears perceptual hashes and global order only.",
-                ):
-                    cache.clear_similarity_cache(path)
-                    st.success("Cleared.")
-            with cc3:
-                if st.button(
-                    "Clear everything", help="Full reset for this folder, including embeddings."
-                ):
-                    cache.clear_all(path)
-                    st.session_state.last_result = None
-                    st.session_state.compare_result = None
-                    st.success("Cleared. Re-analyze to start from scratch.")
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            if st.button(
+                "Clear clustering & projections",
+                help="Keeps embeddings — clears trees, axes, t-SNE, UMAP, global order.",
+            ):
+                cache.invalidate_tree_and_axes(path)
+                st.session_state.last_result = None
+                st.success("Cleared. Re-analyze to recompute.")
+        with cc2:
+            if st.button(
+                "Clear visual similarity cache",
+                help="Clears perceptual hashes and global order only.",
+            ):
+                cache.clear_similarity_cache(path)
+                st.success("Cleared.")
+        with cc3:
+            if st.button(
+                "Clear everything", help="Full reset for this folder, including embeddings."
+            ):
+                cache.clear_all(path)
+                st.session_state.last_result = None
+                st.session_state.compare_result = None
+                st.success("Cleared. Re-analyze to start from scratch.")
+        st.divider()
+
+    st.markdown("**All cached datasets**")
+    st.caption(
+        "Every dataset analyzed on this machine so far, regardless of what's typed "
+        "in the path field above right now — useful for clearing space or starting "
+        "fresh without needing to re-enter a path first."
+    )
+    cached_datasets = cache.list_cached_datasets()
+    if not cached_datasets:
+        st.caption("Nothing cached yet — analyze a dataset above to start building the cache.")
+    else:
+        total_size_all = sum(d.total_size_bytes for d in cached_datasets)
+        st.caption(f"{len(cached_datasets)} dataset(s) cached, {total_size_all / 1_048_576:.1f} MB total.")
+
+        def _clear_cached_dataset(dataset_root_path: str) -> None:
+            cache.clear_all(dataset_root_path)
+            if st.session_state.last_result and st.session_state.last_result["path"] == dataset_root_path:
+                st.session_state.last_result = None
+            if st.session_state.compare_result and st.session_state.compare_result["path"] == dataset_root_path:
+                st.session_state.compare_result = None
+                st.session_state.combined_base_axes = None
+                st.session_state.compare_base_axes = None
+
+        for i, d in enumerate(cached_datasets):
+            col_info, col_button = st.columns([5, 1])
+            with col_info:
+                cached_at_display = d.cached_at.split("T")[0] if "T" in d.cached_at else d.cached_at
+                st.caption(
+                    f"**{d.root_path}** — {d.n_images:,} images, "
+                    f"{d.total_size_bytes / 1_048_576:.1f} MB, cached {cached_at_display}"
+                )
+            with col_button:
+                st.button(
+                    "Clear",
+                    key=f"clear_cached_dataset_{i}",
+                    on_click=_clear_cached_dataset,
+                    args=(d.root_path,),
+                )
+
+        st.divider()
+
+        def _clear_all_cached_datasets() -> None:
+            for dataset in cached_datasets:
+                cache.clear_all(dataset.root_path)
+            cache.clear_all_pair_caches()
+            st.session_state.last_result = None
+            st.session_state.compare_result = None
+            st.session_state.combined_base_axes = None
+            st.session_state.compare_base_axes = None
+
+        st.button(
+            "Clear ALL cached datasets",
+            help="Also clears every combined-comparison cache below.",
+            on_click=_clear_all_cached_datasets,
+        )
+
+    st.divider()
+    st.markdown("**Dataset-comparison caches**")
+    st.caption(
+        "Combined-comparison caches (from analyzing two datasets together) live "
+        "separately from the per-dataset ones above, and can't be listed individually "
+        "by name — clearing them just means the next comparison re-combines from "
+        "scratch."
+    )
+
+    def _clear_pair_caches() -> None:
+        cache.clear_all_pair_caches()
+        st.session_state.combined_base_axes = None
+        st.session_state.compare_base_axes = None
+
+    st.button("Clear all dataset-comparison caches", on_click=_clear_pair_caches)
 

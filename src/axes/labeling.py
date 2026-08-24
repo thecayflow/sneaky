@@ -49,6 +49,7 @@ import math
 import re
 from collections import Counter
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 from PIL import Image
@@ -459,17 +460,26 @@ class ClusterLabeler:
         embeddings: np.ndarray,
         paths: list[Path],
         top_n: int = DEFAULT_TOP_N_REPRESENTATIVES,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> list[ClusterLabel]:
         """
         Caption representative images for every cluster first, THEN derive
         labels jointly via TF-IDF — a cluster's label depends on what all
         the OTHER clusters look like too, so this can't be done one cluster
         at a time.
+
+        on_progress: optional (done, total_clusters) callback, called once
+        per cluster as its captioning finishes — no throttling needed here
+        (unlike ClipEmbedder.embed_images' own on_progress), since the
+        number of clusters is typically small (a few dozen at most), so
+        every update is already infrequent and meaningful. None (the
+        default): no callback, exactly today's behavior.
         """
         all_representative_paths: list[list[Path]] = []
         all_captions: list[list[str]] = []
+        total_clusters = len(clusters)
 
-        for cluster in clusters:
+        for i, cluster in enumerate(clusters):
             representative_paths = self._pick_representative_paths(
                 cluster, embeddings, paths, top_n
             )
@@ -482,6 +492,8 @@ class ClusterLabeler:
                 cluster.size,
                 captions,
             )
+            if on_progress is not None:
+                on_progress(i + 1, total_clusters)
 
         labels = _extract_keywords(all_captions)
 

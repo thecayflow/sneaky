@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pillow_heif
@@ -32,11 +33,17 @@ pillow_heif.register_heif_opener()
 logger = logging.getLogger(__name__)
 
 # Default number of background processes that decode/preprocess images in
-# parallel while the GPU works on the previous batch. On a Windows/Streamlit
-# setup this uses real subprocesses (not threads) — if you hit odd errors
-# mentioning "spawn" or the app seems to relaunch itself, pass
-# num_workers=0 to ClipEmbedder.embed_images(...) to fall back to the
-# original single-process behavior while we investigate.
+# parallel while the GPU works on the previous batch. Set to 0 (single
+# process, no parallelism) after a real Windows failure: PyTorch's
+# DataLoader multiprocessing (num_workers>0) uses the 'spawn' start method
+# on Windows, which re-launches a whole new Python interpreter per worker —
+# under a Streamlit-launched process this occasionally failed with
+# `OSError: [WinError 6] Controlador no válido` inside
+# multiprocessing/spawn.py. Single-process loading is slower but doesn't
+# depend on Windows handle duplication working correctly in this
+# environment. If you have a Linux/macOS setup (or a Windows one where
+# parallel loading is confirmed to work reliably), raising this back up is
+# safe to try — just watch for the same "spawn"-related error returning.
 DEFAULT_NUM_WORKERS = 0
 
 # Default model — good speed/quality balance on a single consumer GPU.
@@ -89,6 +96,7 @@ class ClipEmbedder:
         image_paths: list[Path],
         batch_size: int = 32,
         num_workers: int = DEFAULT_NUM_WORKERS,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> EmbeddingResult:
         """
         Compute L2-normalized CLIP embeddings for a list of image paths.
@@ -102,6 +110,15 @@ class ClipEmbedder:
 
         Images that fail to load are skipped and reported separately
         rather than crashing the whole run.
+
+        on_progress: optional (done, total) callback, called as batches
+        complete — throttled to roughly once per percentage point (or
+        every batch, whichever is less frequent) rather than every single
+        image, so a UI progress bar doesn't get flooded with updates on a
+        large dataset. None (the default): no callback, exactly today's
+        behavior — this stays optional so every non-Streamlit caller
+        (scripts, tests) is unaffected. Purely additive to the existing
+        tqdm progress bar below, which keeps working the same either way.
         """
         import torch
         from torch.utils.data import DataLoader, Dataset
@@ -172,6 +189,12 @@ class ClipEmbedder:
         all_embeddings: list[np.ndarray] = []
         valid_paths: list[Path] = []
         failed: list[tuple[Path, str]] = []
+        total_images = len(image_paths)
+        # Throttled to roughly once per percentage point (never less often
+        # than once per batch either way) — calling on_progress on every
+        # single image would flood a UI progress bar with far more updates
+        # than it needs on a large dataset, without any benefit.
+        _last_reported_pct = -1
 
         with torch.no_grad(), tqdm(
             total=len(image_paths), desc="Embedding images", unit="img"
@@ -181,6 +204,13 @@ class ClipEmbedder:
                     logger.warning("Failed to load %s for embedding: %s", path, reason)
                 failed.extend(batch_failed)
                 pbar.update(len(batch_paths) + len(batch_failed))
+
+                if on_progress is not None:
+                    done = pbar.n
+                    pct = int(100 * done / total_images) if total_images else 100
+                    if pct != _last_reported_pct or done == total_images:
+                        on_progress(done, total_images)
+                        _last_reported_pct = pct
 
                 if batch_tensor is None:
                     continue
