@@ -430,7 +430,20 @@ def _open_axis_dialog(label: str, scope: str = "primary") -> None:
 
 
 def _close_axis_dialog() -> None:
+    """
+    Used two ways: (1) as the on_click callback for the dialog's own
+    manual close button, and (2) passed directly as show_axis_images_
+    dialog's own on_dismiss callable — Streamlit calls it BEFORE the
+    rerun it triggers on any dismissal (native X, ESC, click-outside),
+    so viewing_axis is already cleared by the time the top-level
+    "if st.session_state.viewing_axis:" guard re-checks whether to call
+    the dialog function again. Without clearing it here specifically —
+    e.g. relying only on Streamlit's own on_dismiss="rerun" string,
+    with nothing to actually reset the state that controls whether to
+    reopen — the dialog would reopen immediately after closing.
+    """
     st.session_state.viewing_axis = None
+    st.session_state.viewing_axis_scope = None
     st.session_state.zoomed_image_path = None
 
 
@@ -836,7 +849,7 @@ def _render_axis_management_row(
             # once above, applies to both rows.
 
 
-@st.dialog("Axis images", width="large", dismissible=False)
+@st.dialog("Axis images", width="large", dismissible=True, on_dismiss=_close_axis_dialog)
 def show_axis_images_dialog(
     label: str,
     embeddings,
@@ -868,30 +881,24 @@ def show_axis_images_dialog(
     else (the axis list, Copy images, the radar/scatter) — without this,
     an axis with genuinely no matches in one dataset could still "win"
     for an unrelated image in that dataset alone.
+
+    CLOSE MECHANISM (changed — see BACKLOG.md/DEVELOPMENT.md for the
+    prior manual version if this ever needs reverting): dismissible=True
+    + on_dismiss=_close_axis_dialog uses Streamlit's own NATIVE dialog-
+    dismissal handling (clicking the native X, pressing ESC, or clicking
+    outside the dialog) instead of a custom close button plus a manual
+    `if viewing_axis != label: st.rerun(scope="app")` escape hatch. That
+    manual pattern — st.rerun() called from behind an if-block inside a
+    dialog — matches a confirmed Streamlit bug (streamlit/streamlit#13009)
+    where the dialog can re-render instead of actually closing, which is
+    the most likely explanation for the "proven unreliable in some
+    environments" comment the old code carried. _close_axis_dialog runs
+    as the on_dismiss callback BEFORE Streamlit's own triggered rerun,
+    clearing viewing_axis/viewing_axis_scope so the top-level
+    "if st.session_state.viewing_axis:" guard doesn't call this function
+    again on that same rerun — without that, the dialog would reopen
+    immediately after closing.
     """
-    # Close button rendered FIRST, unconditionally, before any other logic
-    # — guarantees there's always a manual way to close this dialog, no
-    # matter what state led to it being open. The automatic self-close
-    # rerun below (for when the Close button itself was clicked) has
-    # proven unreliable in some environments, so this is the real safety
-    # net, not just a nicety.
-    header_col, close_col = st.columns([10, 1])
-    with close_col:
-        st.button("✕", key="close_axis_dialog", on_click=_close_axis_dialog, help="Close")
-
-    if st.session_state.viewing_axis != label:
-        # We've been asked to close (Close button already cleared
-        # viewing_axis via its callback), or something else cleared it
-        # out from under us. A normal rerun triggered from inside a
-        # dialog only re-runs the dialog itself (it behaves like a
-        # fragment), which would just redraw this same content — so we
-        # force a full app-level rerun instead, which re-checks the
-        # top-level "should this dialog even be shown" condition and
-        # actually closes it. If that somehow doesn't take effect, the
-        # Close button above still works as a manual fallback.
-        st.rerun(scope="app")
-        return
-
     ranked = get_ranked_images_for_axis(
         embeddings, axes, paths, label, other_threshold=other_threshold, standardize_reference=standardize_reference
     )
@@ -914,14 +921,13 @@ def show_axis_images_dialog(
     total = len(tagged)
     shown = min(st.session_state.thumb_shown_count, total)
 
-    with header_col:
-        st.subheader(label)
-        if label == OTHER_LABEL:
-            st.caption(f"{total} images — ordered worst-fit first (clearest outliers)")
-        else:
-            st.caption(f"{total} images — ordered by similarity to the axis, closest first")
-        if extra_source is not None:
-            st.caption(f"🔵 {primary_dataset_name}   🟠 {extra_source['dataset_name']}")
+    st.subheader(label)
+    if label == OTHER_LABEL:
+        st.caption(f"{total} images — ordered worst-fit first (clearest outliers)")
+    else:
+        st.caption(f"{total} images — ordered by similarity to the axis, closest first")
+    if extra_source is not None:
+        st.caption(f"🔵 {primary_dataset_name}   🟠 {extra_source['dataset_name']}")
 
     if st.session_state.zoomed_image_path:
         st.button("◀ Back to grid", key="back_to_grid", on_click=_unzoom_image)
