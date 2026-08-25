@@ -2279,6 +2279,19 @@ if result is not None:
             radar_normalized_values = {
                 label: v for label, v in radar_normalized_values.items() if label != OTHER_LABEL
             }
+            # Raw per-axis image counts — a THIRD radar variant, additive
+            # (unlike the two above, which are percentage-like and don't
+            # mean anything summed). Only rendered when comparing two
+            # datasets, stacked per axis — see _render_radar_charts.
+            radar_counts_values = get_axis_counts_by_dominance(
+                result["embeddings"],
+                full_axes,
+                other_threshold=other_threshold,
+                standardize_reference=standardize_reference,
+            )
+            radar_counts_values = {
+                label: v for label, v in radar_counts_values.items() if label != OTHER_LABEL
+            }
 
             # Same two variants for the comparison feed, when loaded —
             # scored against the SAME full_axes as the primary feed (it
@@ -2286,6 +2299,7 @@ if result is not None:
             # radar's overlay above.
             radar_dominance_values_compare = None
             radar_normalized_values_compare = None
+            radar_counts_values_compare = None
             if compare_result is not None:
                 radar_dominance_values_compare = get_radar_values_by_dominance(
                     compare_result["embeddings"],
@@ -2304,6 +2318,17 @@ if result is not None:
                 radar_normalized_values_compare = {
                     label: v
                     for label, v in radar_normalized_values_compare.items()
+                    if label != OTHER_LABEL
+                }
+                radar_counts_values_compare = get_axis_counts_by_dominance(
+                    compare_result["embeddings"],
+                    full_axes,
+                    other_threshold=other_threshold,
+                    standardize_reference=standardize_reference,
+                )
+                radar_counts_values_compare = {
+                    label: v
+                    for label, v in radar_counts_values_compare.items()
                     if label != OTHER_LABEL
                 }
 
@@ -2381,6 +2406,8 @@ if result is not None:
                 radar_normalized_values=radar_normalized_values,
                 radar_dominance_values_compare=radar_dominance_values_compare,
                 radar_normalized_values_compare=radar_normalized_values_compare,
+                radar_counts_values=radar_counts_values,
+                radar_counts_values_compare=radar_counts_values_compare,
                 umap_coords=umap_coords,
                 umap_labels=umap_dominant_labels,
                 umap_dataset_origin=umap_dataset_origin,

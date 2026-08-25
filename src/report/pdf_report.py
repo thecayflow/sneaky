@@ -980,7 +980,7 @@ def _render_treemap(
     return buf
 
 
-def _render_dual_radar(
+def _render_radar_charts(
     labels: list[str],
     dominance_values: dict[str, float],
     normalized_values: dict[str, float],
@@ -988,15 +988,26 @@ def _render_dual_radar(
     dominance_values_compare: dict[str, float] | None = None,
     normalized_values_compare: dict[str, float] | None = None,
     compare_dataset_name: str | None = None,
+    counts_values: dict[str, int] | None = None,
+    counts_values_compare: dict[str, int] | None = None,
 ) -> io.BytesIO:
     """
-    Two polar radar charts side by side — Dominance % and Normalized
-    similarity, same axes, for direct visual comparison. When a second
-    (comparison) dataset's values are provided, both are OVERLAID as
-    separate polygons on each panel — never stacked/summed, since these
-    are percentage-like values where a sum wouldn't mean anything
-    coherent (same reasoning the live app's Stacked mode already applies:
-    it's only offered for additive raw counts).
+    Two or three polar radar charts side by side. The first two — Dominance
+    % and Normalized similarity, same axes, for direct visual comparison —
+    always render, with both datasets OVERLAID as separate polygons on
+    each panel when comparing (never stacked/summed, since these are
+    percentage-like values where a sum wouldn't mean anything coherent —
+    same reasoning the live app's Stacked mode already applies: it's only
+    offered for additive raw counts).
+
+    A THIRD panel — raw per-axis image counts, genuinely additive, drawn
+    as STACKED polar bars (each dataset's wedge starts where the other's
+    ends, so the total height reads as the combined count) — renders only
+    when comparing two datasets AND counts_values/counts_values_compare
+    are both provided. With a single dataset, "stacked" has nothing to
+    stack against, so this panel is simply omitted rather than showing a
+    single dataset's bars alone (which the Dominance panel already
+    covers, just as a proportion instead of a raw count).
     """
     import matplotlib
 
@@ -1004,11 +1015,20 @@ def _render_dual_radar(
     import matplotlib.pyplot as plt
 
     multi_dataset = dominance_values_compare is not None and normalized_values_compare is not None
+    show_counts_panel = multi_dataset and counts_values is not None and counts_values_compare is not None
+    n_panels = 3 if show_counts_panel else 2
 
     angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
     angles_closed = angles + angles[:1]
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.2), dpi=200, subplot_kw=dict(polar=True))
+    # Width scales with panel count so each individual panel keeps
+    # roughly the same size — the caller fits the whole figure into a
+    # fixed page width regardless, so a 3-panel figure at the SAME width
+    # as a 2-panel one would just make each panel smaller and more
+    # cramped for no reason.
+    fig, axes = plt.subplots(
+        1, n_panels, figsize=(5.4 * n_panels, 5.2), dpi=200, subplot_kw=dict(polar=True)
+    )
 
     panels = [
         (dominance_values, dominance_values_compare, "Dominance (% of images)", lambda v: f"{v * 100:.0f}%"),
@@ -1071,12 +1091,62 @@ def _render_dual_radar(
                 fontsize=8, frameon=False, labelcolor=MPL_NEUTRAL_600,
             )
 
+    if show_counts_panel:
+        # Stacked polar BAR chart (not overlaid lines like the two panels
+        # above) — each dataset's wedge starts where the other's ends, so
+        # the total bar height at each axis reads as the combined count
+        # across both datasets. This only makes sense for genuinely
+        # additive values (raw counts), unlike Dominance/Normalized above.
+        ax3 = axes[2]
+        counts_a = [counts_values.get(lbl, 0) for lbl in labels]
+        counts_b = [counts_values_compare.get(lbl, 0) for lbl in labels]
+        bar_width = (2 * np.pi / len(labels)) * 0.75
+        ax3.bar(
+            angles, counts_a, width=bar_width, color=MPL_ACCENT, label=dataset_name,
+            edgecolor=MPL_BG, linewidth=0.8,
+        )
+        ax3.bar(
+            angles, counts_b, width=bar_width, bottom=counts_a, color=MPL_ACCENT_COMPARE,
+            label=compare_dataset_name, edgecolor=MPL_BG, linewidth=0.8,
+        )
+        totals = [a + b for a, b in zip(counts_a, counts_b)]
+        for angle, total in zip(angles, totals):
+            ax3.annotate(
+                f"{total:,}",
+                xy=(angle, total),
+                xytext=(0, 6),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=6.5,
+                color=MPL_TEXT,
+                **_mpl_font("bold"),
+            )
+        ax3.set_xticks(angles)
+        ax3.set_xticklabels(labels, fontsize=8, color=MPL_NEUTRAL_600)
+        ax3.set_title("Image count (stacked)", fontsize=11, color=MPL_TEXT, pad=18, **_mpl_font("bold"))
+        ax3.tick_params(axis="y", labelsize=7, colors=MPL_NEUTRAL_600)
+        ax3.spines["polar"].set_color(MPL_NEUTRAL_300)
+        ax3.grid(color=MPL_NEUTRAL_300)
+        if totals:
+            ax3.set_ylim(0, max(totals) * 1.22)
+        ax3.legend(
+            loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=2,
+            fontsize=8, frameon=False, labelcolor=MPL_NEUTRAL_600,
+        )
+
     if multi_dataset:
         title_names = f"{dataset_name} vs {compare_dataset_name}"
     else:
         title_names = dataset_name
-    fig.suptitle(f"Semantic radar — {title_names}", fontsize=12, color=MPL_TEXT, **_mpl_font("bold"))
-    fig.tight_layout()
+    # y= explicit and higher than the default, with tight_layout's own
+    # rect reserving that same top margin — otherwise, with 3 panels, the
+    # figure's horizontal CENTER (where the suptitle sits by default)
+    # falls right on top of the middle panel's own subtitle instead of
+    # in the empty gap between two panels, which is where it fell with
+    # only 2.
+    fig.suptitle(f"Semantic radar — {title_names}", fontsize=12, color=MPL_TEXT, y=1.04, **_mpl_font("bold"))
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", transparent=True)
     plt.close(fig)
@@ -1522,6 +1592,8 @@ def generate_pdf_report(
     radar_normalized_values: dict[str, float] | None = None,
     radar_dominance_values_compare: dict[str, float] | None = None,
     radar_normalized_values_compare: dict[str, float] | None = None,
+    radar_counts_values: dict[str, int] | None = None,
+    radar_counts_values_compare: dict[str, int] | None = None,
     umap_coords: np.ndarray | None = None,
     umap_labels: list[str] | None = None,
     umap_dataset_origin: list[str] | None = None,
@@ -2171,7 +2243,7 @@ def generate_pdf_report(
             story.append(Spacer(1, SP_4))
             header_h += SP_4
         radar_labels = sorted(set(radar_dominance_values) | set(radar_normalized_values))
-        radar_buf = _render_dual_radar(
+        radar_buf = _render_radar_charts(
             radar_labels,
             radar_dominance_values,
             radar_normalized_values,
@@ -2179,6 +2251,8 @@ def generate_pdf_report(
             radar_dominance_values_compare,
             radar_normalized_values_compare,
             compare_dataset_name,
+            counts_values=radar_counts_values,
+            counts_values_compare=radar_counts_values_compare,
         )
         radar_frame = _Blueprint(_rl_image_for_width(radar_buf, landscape_w - 26), pad=6, margin=7)
         remaining_h = landscape_h - header_h
