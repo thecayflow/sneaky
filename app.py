@@ -460,17 +460,39 @@ def _unzoom_image() -> None:
 
 
 def _close_scatter_selection() -> None:
-    # Remember what we just dismissed, so the still-selected point on the
-    # Plotly chart (selections persist across reruns until a NEW click)
-    # doesn't immediately re-open the same dialog.
+    """
+    Used two ways: (1) as the on_click callback for the dialog's own
+    manual close button, and (2) passed directly as show_single_image_
+    dialog's own on_dismiss callable — Streamlit calls it BEFORE the
+    rerun it triggers on any dismissal (native X, ESC, click-outside),
+    so scatter_selected_info is already cleared by the time the
+    top-level "if st.session_state.scatter_selected_info:" guard
+    re-checks whether to call the dialog function again. Same reasoning
+    as _close_axis_dialog — see its own docstring and DEVELOPMENT.md for
+    the full story on why this replaced a manual st.rerun()-behind-an-if
+    pattern that matched a confirmed Streamlit bug.
+
+    Remember what we just dismissed, so the still-selected point on the
+    Plotly chart (selections persist across reruns until a NEW click)
+    doesn't immediately re-open the same dialog.
+    """
     if st.session_state.scatter_selected_info:
         st.session_state.scatter_dismissed_path = st.session_state.scatter_selected_info["path"]
     st.session_state.scatter_selected_info = None
 
 
 def _show_similar_from_scatter(axis_label: str) -> None:
-    """'Show similar' — closes this single-image dialog and opens the axis
-    mosaic instead, reusing the exact same escape mechanism as closing."""
+    """
+    'Show similar' — closes this single-image dialog and opens the axis
+    mosaic instead. Only updates state here — does NOT call st.rerun()
+    itself: calling st.rerun() from inside an on_click callback is a
+    documented Streamlit no-op ("Calling st.rerun() within a callback is
+    a no-op"), confirmed by testing here (the callback's state changes
+    took effect, but nothing visibly happened until the dialog was
+    separately dismissed). The actual rerun that opens the other dialog
+    happens in show_single_image_dialog's own body, right after this
+    button — see the comment there for why.
+    """
     if st.session_state.scatter_selected_info:
         st.session_state.scatter_dismissed_path = st.session_state.scatter_selected_info["path"]
     st.session_state.scatter_selected_info = None
@@ -478,25 +500,21 @@ def _show_similar_from_scatter(axis_label: str) -> None:
     st.session_state.thumb_shown_count = THUMB_BATCH_SIZE
 
 
-@st.dialog("Image", width="large", dismissible=False)
+@st.dialog("Image", width="large", dismissible=True, on_dismiss=_close_scatter_selection)
 def show_single_image_dialog(info: dict) -> None:
-    current = st.session_state.scatter_selected_info
-    if current is None or current["path"] != info["path"]:
-        # Same escape trick as show_axis_images_dialog below: a rerun
-        # triggered from inside a dialog only re-runs the dialog itself
-        # (fragment behavior), so force a full app rerun to actually close.
-        st.rerun(scope="app")
-        return
-
+    """
+    CLOSE MECHANISM (changed — see DEVELOPMENT.md for the full story):
+    dismissible=True + on_dismiss=_close_scatter_selection replaces the
+    old dismissible=False + manual "✕" button + `if current is None or
+    ...: st.rerun(scope="app")` escape hatch, which matched a confirmed
+    Streamlit bug (streamlit/streamlit#13009). "Show similar" is handled
+    separately (see _show_similar_from_scatter's own docstring) since
+    it's not a plain dismissal — it opens a DIFFERENT dialog, which
+    on_dismiss alone can't do.
+    """
     path_str = info["path"]
 
-    header_col, close_col = st.columns([10, 1])
-    with header_col:
-        st.subheader(info["filename"])
-    with close_col:
-        st.button(
-            "✕", key="close_scatter_dialog", on_click=_close_scatter_selection, help="Close"
-        )
+    st.subheader(info["filename"])
 
     meta_col1, meta_col2, meta_col3 = st.columns(3)
     meta_col1.metric("Dominant axis", info["axis"])
@@ -523,6 +541,23 @@ def show_single_image_dialog(info: dict) -> None:
         args=(info["axis"],),
         help="Browse the mosaic of images that dominate this same axis.",
     )
+    if st.session_state.viewing_axis is not None:
+        # "Show similar" was just clicked (its on_click callback above
+        # set viewing_axis) — a plain click on a button INSIDE a dialog
+        # only reruns the dialog itself (fragment behavior), not the
+        # whole script, so nothing else would otherwise re-check the
+        # top-level "if st.session_state.viewing_axis: ..." guard that
+        # actually opens the axis mosaic. st.rerun() can't live inside
+        # the callback itself (confirmed no-op — see
+        # _show_similar_from_scatter's own docstring), so this check has
+        # to live here instead, in the dialog's own body, evaluated
+        # AFTER the button rather than wrapping its return value
+        # directly — related to, but not quite the same pattern as, the
+        # confirmed Streamlit bug streamlit/streamlit#13009 ("if
+        # statement that uses the return value from an st.button").
+        # Watch this specifically if "Show similar" ever seems to stall
+        # again — see DEVELOPMENT.md for the full investigation trail.
+        st.rerun(scope="app")
 
 
 def _pooled_score_reference(result, compare_result, full_axes):

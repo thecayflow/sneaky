@@ -438,3 +438,173 @@ around wherever it seems to originate, consider whether it might not be
 triggered by this project's own code at all — Streamlit's own file
 watcher re-touching every loaded module on every rerun is a real, easy-
 to-miss trigger for lazy-import side effects in large libraries.
+
+### "View images" dialog closing unreliably — a confirmed Streamlit bug, not our code
+
+**When**: a UX review flagged that the "Axis images" modal ("View images")
+sometimes appeared to hang or not close when dismissed, particularly
+right after a fresh "Analyze" — the click registered, but the dialog
+stayed open or briefly flickered before actually closing.
+
+**What the dialog looked like before**: `@st.dialog("Axis images",
+width="large", dismissible=False)`, with a custom "✕" button inside the
+dialog body (`on_click=_close_axis_dialog`, clearing `viewing_axis`) and,
+separately, this escape hatch at the top of the dialog function:
+
+```python
+if st.session_state.viewing_axis != label:
+    st.rerun(scope="app")
+    return
+```
+
+The reasoning at the time (per the code's own comment): a rerun
+triggered by a widget INSIDE a dialog only reruns the dialog function
+itself (dialogs inherit fragment-like behavior — interacting with a
+widget inside one doesn't rerun the whole script), so an explicit
+app-scoped rerun was needed to make the top-level "should this dialog
+even be shown" check (`if st.session_state.viewing_axis: ...`) re-run
+and actually stop calling the dialog function.
+
+**Why it was actually unreliable**: this exact pattern — `st.rerun()`
+called from behind an `if` block, inside a dialog function — matches a
+bug **confirmed by the Streamlit team**: [streamlit/streamlit#13009](https://github.com/streamlit/streamlit/issues/13009),
+"Dialog is re-executed if `st.rerun` is triggered in an `if` statement
+that uses the return value from an `st.button`." In certain cases, this
+causes the dialog to re-render instead of actually closing — which lines
+up exactly with the "proven unreliable in some environments" comment the
+old code carried, and which a first UX-review report (correctly)
+diagnosed as *a* real problem, but attributed primarily to expensive
+downstream sections (Scatter view, Visual similarity chain) being
+re-executed by the app-scoped rerun — plausible on its face, but this
+project's own code already memoizes both of those in `session_state`
+specifically to avoid exactly that (see their own "expensive enough...
+redoing it on every unrelated rerun" comments) — so in practice, the
+expensive-recompute path only bites on a narrow window (right after
+Analyze, before either section has computed even once this session), not
+on every close. The `st.rerun()`-behind-an-`if` pattern itself, not
+downstream recomputation cost, was the more likely primary cause of the
+"sometimes doesn't close" symptom.
+
+**The fix**: checked the officially documented behavior for the EXACT
+Streamlit version installed (1.62.0 — `pip show streamlit`) rather than
+assuming based on general knowledge, since `st.dialog`'s parameters have
+changed across versions. Confirmed `on_dismiss` is a real, documented
+parameter in this version:
+
+```python
+def _close_axis_dialog() -> None:
+    st.session_state.viewing_axis = None
+    st.session_state.viewing_axis_scope = None
+    st.session_state.zoomed_image_path = None
+
+@st.dialog("Axis images", width="large", dismissible=True, on_dismiss=_close_axis_dialog)
+def show_axis_images_dialog(...):
+    ...
+```
+
+`dismissible=True` restores the native X / ESC / click-outside dismissal
+(disabled before, which is *why* the manual "✕" + escape-hatch pattern
+existed in the first place — with `dismissible=False`, Streamlit gives
+you no dismissal handling of its own at all, so the old code had to
+build its own). `on_dismiss` accepts a callable (not just the strings
+`"ignore"`/`"rerun"`) that Streamlit calls **before** the rerun it
+triggers on any dismissal — this is what makes it safe: `viewing_axis` is
+already cleared by the time the top-level guard re-checks whether to
+call the dialog function again.
+
+**The trap this narrowly avoids** (flagged during design, worth knowing
+if this is ever touched again): using `on_dismiss="rerun"` — the bare
+string, not a callable — would NOT clear `viewing_axis`. Streamlit would
+still rerun the app on dismissal, but nothing would have reset the state
+the top-level `if st.session_state.viewing_axis: show_axis_images_dialog(...)`
+guard checks — so the dialog would immediately reopen after closing. The
+callable form is what makes this safe; don't simplify it back to a bare
+string without also solving that.
+
+**Not yet applied elsewhere**: `show_single_image_dialog` (the Scatter
+view's own single-image dialog) has the exact same old pattern —
+`dismissible=False` + `st.rerun(scope="app")` behind an `if`, with a
+comment literally saying "Same escape trick as show_axis_images_dialog
+below." Deliberately left untouched in this round (one dialog at a time,
+confirmed working before moving to the next) — a natural candidate for
+the same fix later.
+
+**Why it matters going forward**: `st.rerun()` placed behind an `if`
+block inside any `@st.dialog`-decorated function is a known-unreliable
+pattern in Streamlit 1.62.0, confirmed by its own maintainers — prefer
+`on_dismiss` (with a callable if any state needs clearing before the
+rerun) over a manual detect-and-rerun escape hatch for any new dialog
+added to this project. When in doubt about a `st.dialog`/`st.fragment`
+parameter's exact behavior, check the docs for the SPECIFIC version
+installed (`pip show streamlit`) rather than assuming — parameters like
+`on_dismiss` have changed across Streamlit versions, and general
+knowledge of the API can be stale or version-specific in ways that
+matter here.
+
+### Follow-up: the Scatter view's own single-image dialog, and a second Streamlit gotcha
+
+**When**: applying the same `on_dismiss` fix to `show_single_image_dialog`
+(the Scatter view's own image dialog — same old pattern, same
+`dismissible=False` + manual escape hatch, same code comment pointing
+back at the axis dialog above as the origin of the pattern).
+
+**The extra wrinkle this one has**: unlike the axis dialog, this one has
+a "Show similar" button that doesn't just dismiss the dialog — it closes
+THIS dialog and opens a DIFFERENT one (`show_axis_images_dialog`, by
+setting `st.session_state.viewing_axis`). `on_dismiss` can't cover this:
+it only fires on an actual Streamlit-recognized dismissal (native X,
+ESC, click-outside), not on an arbitrary button click that happens to
+also want to close the dialog as a side effect.
+
+**First attempt, and why it silently failed**: called `st.rerun(scope=
+"app")` directly inside `_show_similar_from_scatter`'s own `on_click`
+body — reasoning that a rerun triggered from inside a callback, rather
+than from behind an `if` checking a button's return value afterward,
+would sidestep the confirmed bug (#13009) from the section above. This
+compiled fine and looked reasonable, but did nothing when tested: the
+callback's own state changes (`viewing_axis` getting set) took effect,
+but nothing visibly happened until the dialog was separately dismissed —
+at which point the OTHER dialog would finally open, one interaction
+late. The cause: **calling `st.rerun()` from inside any Streamlit
+callback (`on_click`, `on_change`, etc.) is a documented no-op** —
+"Calling st.rerun() within a callback is a no-op" — confirmed across
+several Streamlit GitHub issues (e.g. streamlit/streamlit#10501) and the
+official community forum, unrelated to the dialog-specific bug from the
+section above. Streamlit already schedules its own rerun immediately
+after any callback finishes, so an explicit one from inside the callback
+itself is discarded.
+
+**The actual fix**: split the concerns cleanly. The callback
+(`_show_similar_from_scatter`) ONLY updates `session_state` now — no
+`st.rerun()` call at all. The check for whether to escalate to an
+app-scoped rerun lives in the DIALOG'S OWN BODY, evaluated right after
+the button, not wrapping its return value directly:
+
+```python
+st.button("Show similar", on_click=_show_similar_from_scatter, args=(info["axis"],))
+if st.session_state.viewing_axis is not None:
+    st.rerun(scope="app")
+```
+
+This still technically involves `st.rerun()` behind an `if` inside a
+dialog — related to, though not textually identical to, the pattern in
+the confirmed bug #13009 (which specifically describes wrapping a
+button's OWN return value, e.g. `if st.button(...): st.rerun()` — this
+checks a `session_state` flag the callback set, one step removed from
+the button's own return value). No cleaner native alternative exists in
+this Streamlit version for "dismiss this dialog and open a different
+one" — `on_dismiss` only covers plain dismissal, not a click that wants
+to redirect elsewhere. Confirmed working by the user across two full
+open → Show similar → close cycles, not just once.
+
+**Why it matters going forward**: two SEPARATE Streamlit gotchas live in
+this dialog pair, easy to conflate — (1) `st.rerun()` behind an `if`
+inside a dialog can fail to actually close it (#13009, the axis dialog's
+own story above), and (2) `st.rerun()` inside ANY callback is a no-op,
+full stop, regardless of dialogs (a more general Streamlit behavior).
+Moving a `st.rerun()` from a callback into the surrounding script body
+to work around (2) can still run into (1) if done carelessly (e.g.
+wrapping a button's return value directly) — if a future dialog needs
+"close this and open something else," reach for the session_state-flag-
+checked-after-the-button shape used here, not a bare `if st.button(...):
+st.rerun()`.
